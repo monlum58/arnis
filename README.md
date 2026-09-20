@@ -1,5 +1,10 @@
 <img src="assets/git/banner.png" width="100%" alt="Banner">
 
+> ### 🍴 About this fork
+> This is **monlum58's fork** of Arnis, maintained at [github.com/monlum58/arnis](https://github.com/monlum58/arnis). All credit for the original project — design, the vast majority of the code, and ongoing maintenance — goes to **[Louis Erbkamm (louis-e)](https://github.com/louis-e)** and Arnis's contributors at the upstream repository: [github.com/louis-e/arnis](https://github.com/louis-e/arnis). If you're looking for the original project, that's where to go.
+>
+> This fork adds one thing upstream doesn't have: **bounded-memory generation for metro-scale areas.** See [Changes in this fork](#changes-in-this-fork) below for what that means and why. It's a personal fork, not a competing project — everyday users almost certainly want upstream.
+
 # Arnis [![CI Build Status](https://github.com/louis-e/arnis/actions/workflows/ci-build.yml/badge.svg)](https://github.com/louis-e/arnis/actions) [<img alt="GitHub Release" src="https://img.shields.io/github/v/release/louis-e/arnis" />](https://github.com/louis-e/arnis/releases) [<img alt="GitHub Downloads (all assets, all releases" src="https://img.shields.io/github/downloads/louis-e/arnis/total" />](https://github.com/louis-e/arnis/releases) [![Download here](https://img.shields.io/badge/Download-here-green)](https://github.com/louis-e/arnis/releases) [![Discord](https://img.shields.io/discord/1326192999738249267?label=Discord&color=%237289da)](https://discord.gg/mA2g69Fhxq)
 
 Arnis creates complex and accurate Minecraft Java Edition (1.17+), Bedrock Edition, and Luanti (Minetest) worlds that reflect real-world geography, topography, and architecture.
@@ -26,6 +31,22 @@ Additionally, you can customize various generation settings, such as world scale
 Full documentation is available in the [GitHub Wiki](https://github.com/louis-e/arnis/wiki/), covering topics such as technical explanations, FAQs, contribution guidelines and roadmaps.
 
 [backgroundvid.webm](https://github.com/user-attachments/assets/420acc19-a850-418e-8397-1a45b05582ab)
+
+## Changes in this fork
+
+Upstream Arnis already streams its Minecraft voxel data to disk once memory gets tight, but the elevation pipeline (raw terrain fetch, land-cover repair, Gaussian smoothing) held everything fully in RAM. That's fine at city-district scale, but it means the required memory grows with the area you ask for, with no ceiling — a real metro-scale request (a whole "greater Tokyo," for example) could need tens of GB and simply fail on an ordinary desktop.
+
+This fork backs those elevation buffers with a disk-mapped grid instead of plain in-memory arrays, so metro-scale bounding boxes no longer need memory proportional to their area. It also splits oversized Overpass (OpenStreetMap) queries into a grid of smaller sub-queries and merges the results, since a single query over a huge area used to hard-fail outright.
+
+**What changed, concretely:**
+- A bounding box of order 1,000+ km² (a whole metro area) now generates successfully instead of running out of memory or hitting an "area is too large" error.
+- Verified on a real ~2,000 km² area (central Tokyo through most of the 23 wards): completed in about 25 minutes using ~20GB RAM on a 32GB machine.
+- No change to how any generated world looks — every change was checked block-for-block against the unmodified output for the same area (see `examples/world_block_diff.rs`).
+- Added a `--name` CLI flag to name a generated Java Edition world, matching the option the GUI already had.
+
+Small areas (a neighborhood, a city district — what most people use Arnis for) behave exactly as before; none of this changes anything below the scale where it used to work fine already.
+
+Full technical write-up, including the two real bugs found while building this (a memory-mapping gotcha and a slow algorithm access pattern), is in [`DEVELOPMENT_NOTES.md`](DEVELOPMENT_NOTES.md).
 
 ## :trophy: Open Source
 #### Key objectives of this project

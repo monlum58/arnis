@@ -22,3 +22,24 @@ its attribution must be preserved.
 
 The full list of sources, authors and licenses is kept in one place, so it does
 not drift: open "License and Credits" in the app, or read src/gui/js/license.js.
+
+
+Modifications in this fork
+---------------------------
+
+This is a fork of the above project, maintained by monlum58
+(https://github.com/monlum58/arnis), under the same Apache License,
+Version 2.0. Per section 4(b) of that license, this notice records that
+files in this fork have been changed from the original.
+
+Summary of changes (see the fork's git history and README.md for detail):
+  - Bounded-memory large-area generation: the elevation pipeline
+    (raw fetch, terrain post-processing, Gaussian blur) is backed by
+    disk-mapped storage instead of always-resident memory, so
+    metro-scale bounding boxes (~2000 km2, verified) no longer require
+    RAM proportional to area.
+  - Overpass query tiling for large bounding boxes, merged by OSM id.
+  - `--name` CLI flag for naming a generated Java Edition world.
+
+None of the above changes what a generated world looks like for any area
+that already worked before this fork's changes (verified block-for-block).
