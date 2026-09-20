@@ -53,6 +53,7 @@
 use crate::coordinate_system::geographic::LLBBox;
 use crate::elevation::cache::get_cache_dir;
 use crate::elevation::provider::{ElevationProvider, RawElevationGrid};
+use crate::elevation::MmapGrid;
 use fnv::{FnvHashMap, FnvHashSet};
 use rayon::prelude::*;
 use std::fmt::Debug;
@@ -303,7 +304,7 @@ pub(super) struct TileRaster {
 }
 
 impl TileRaster {
-    fn from_rows(rows: Vec<Vec<f64>>) -> Self {
+    fn from_rows(rows: MmapGrid<f64>) -> Self {
         let height = rows.len();
         let width = rows.first().map_or(0, |r| r.len());
         let mut data = vec![f32::NAN; width * height];
@@ -691,7 +692,7 @@ pub(super) fn fetch_fixed_tile_grid<P: FixedTileProvider>(
     // reason to be capped to 4 threads on high-core machines — doing so
     // needlessly slows multi-megapixel grids. The global pool defaults
     // to `num_cpus::get()` threads, which is what we want here.
-    let mut height_grid: Vec<Vec<f64>> = Vec::with_capacity(grid_height);
+    let mut height_grid = MmapGrid::<f64>::new(grid_height, grid_width)?;
     let mut band_start = 0usize;
     while band_start < grid_height {
         let tile_y = row_tile_y[band_start];
@@ -709,11 +710,16 @@ pub(super) fn fetch_fixed_tile_grid<P: FixedTileProvider>(
             provider.log_prefix(),
         );
 
-        let mut rows: Vec<Vec<f64>> = (band_start..band_end)
-            .into_par_iter()
-            .map(|gy| {
+        // Write straight into this band's slice of the mmap grid instead of
+        // collecting a temporary `Vec<Vec<f64>>` and appending it.
+        let band_slice =
+            &mut height_grid.as_flat_mut_slice()[band_start * grid_width..band_end * grid_width];
+        band_slice
+            .par_chunks_mut(grid_width)
+            .zip((band_start..band_end).into_par_iter())
+            .for_each(|(row, gy)| {
                 let my = row_my[gy];
-                let mut row = vec![f64::NAN; grid_width];
+                row.fill(f64::NAN);
                 // Carry the current tile reference across cells; tile_x
                 // changes every ~TILE_PIXELS cells, so most cells reuse
                 // the same tile and skip the hashmap lookup entirely.
@@ -739,10 +745,7 @@ pub(super) fn fetch_fixed_tile_grid<P: FixedTileProvider>(
                         *cell = sample_tile_bilinear(tile, col_mx[gx], my, &cur_key);
                     }
                 }
-                row
-            })
-            .collect();
-        height_grid.append(&mut rows);
+            });
         band_start = band_end;
     }
 
@@ -1022,7 +1025,8 @@ mod tests {
             tile_x: 0,
             tile_y: 0,
         };
-        let tile = TileRaster::from_rows(vec![vec![42.0; TILE_PIXELS]; TILE_PIXELS]);
+        let tile =
+            TileRaster::from_rows(MmapGrid::from_rows(vec![vec![42.0; TILE_PIXELS]; TILE_PIXELS]).unwrap());
         let mx = (key.min_mx() + key.max_mx()) * 0.5;
         let my = (key.min_my() + key.max_my()) * 0.5;
         assert_eq!(sample_tile_bilinear(&tile, mx, my, &key), 42.0);
@@ -1035,15 +1039,14 @@ mod tests {
             tile_x: 0,
             tile_y: 0,
         };
-        let tile = TileRaster::from_rows(
-            (0..TILE_PIXELS)
-                .map(|y| {
-                    (0..TILE_PIXELS)
-                        .map(|x| x as f64 + y as f64 * 1000.0)
-                        .collect()
-                })
-                .collect(),
-        );
+        let rows: Vec<Vec<f64>> = (0..TILE_PIXELS)
+            .map(|y| {
+                (0..TILE_PIXELS)
+                    .map(|x| x as f64 + y as f64 * 1000.0)
+                    .collect()
+            })
+            .collect();
+        let tile = TileRaster::from_rows(MmapGrid::from_rows(rows).unwrap());
         let mpp = key.level.meters_per_pixel();
         let mx_corner = key.min_mx() + 100.0 * mpp;
         let my_corner = key.max_my() - 50.0 * mpp;

@@ -5,7 +5,14 @@ use std::time::Duration;
 
 /// Command-line arguments parser
 #[derive(Parser, Debug)]
-#[command(author, version, about)]
+#[command(
+    author,
+    version,
+    about,
+    after_help = "This is monlum58's fork of Arnis (https://github.com/monlum58/arnis), \
+adding bounded-memory large-area generation (metro-scale bboxes without hitting the RAM \
+limit) and --name. Original Arnis by Louis Erbkamm: https://github.com/louis-e/arnis"
+)]
 pub struct Args {
     /// Bounding box of the area (min_lat,min_lng,max_lat,max_lng).
     /// Required unless --file supplies a local .osm/.xml file to derive it from
@@ -25,6 +32,13 @@ pub struct Args {
     /// Use --output-dir (or the deprecated --path alias) to specify where the world is created.
     #[arg(long = "output-dir", alias = "path")]
     pub path: Option<PathBuf>,
+
+    /// Custom name for the generated world (Java Edition only). Sanitized for
+    /// filesystem safety and de-duplicated against existing worlds in the
+    /// output directory; falls back to the default "Arnis World N" scheme if
+    /// omitted, blank, or entirely invalid after sanitizing.
+    #[arg(long = "name")]
+    pub name: Option<String>,
 
     /// Generate a Bedrock Edition world (.mcworld) instead of Java Edition
     #[arg(long)]

@@ -8,6 +8,7 @@ use crate::celestial::CelestialBody;
 use crate::coordinate_system::geographic::LLBBox;
 use crate::elevation::cache::get_cache_dir;
 use crate::elevation::provider::{ElevationProvider, RawElevationGrid};
+use crate::elevation::MmapGrid;
 use rayon::prelude::*;
 use std::io::Read;
 use std::path::PathBuf;
@@ -157,7 +158,7 @@ impl ElevationProvider for PlanetaryDem {
         std::fs::create_dir_all(&cache_dir)?;
 
         let samples = window.fetch(&spec, self.body, &cache_dir)?;
-        let heights = window.resample(bbox, &samples, grid_width, grid_height, self.body);
+        let heights = window.resample(bbox, &samples, grid_width, grid_height, self.body)?;
 
         Ok(RawElevationGrid {
             heights_meters: heights,
@@ -375,7 +376,7 @@ impl SourceWindow {
         grid_width: usize,
         grid_height: usize,
         body: CelestialBody,
-    ) -> Vec<Vec<f64>> {
+    ) -> std::io::Result<MmapGrid<f64>> {
         let gain = body.terrain_gain();
         let ppd = self.ppd as f64;
         let lon_w = lon_east(bbox.min().lng());
@@ -391,9 +392,11 @@ impl SourceWindow {
             samples[li.min(self.lines - 1) * self.samples + si.min(self.samples - 1)]
         };
 
-        (0..grid_height)
-            .into_par_iter()
-            .map(|gz| {
+        let mut grid = MmapGrid::<f64>::new(grid_height, grid_width)?;
+        grid.as_flat_mut_slice()
+            .par_chunks_mut(grid_width.max(1))
+            .zip((0..grid_height).into_par_iter())
+            .for_each(|(row, gz)| {
                 // Grid row 0 is the north edge, matching the raster's line order.
                 let t = if grid_height > 1 {
                     gz as f64 / (grid_height - 1) as f64
@@ -404,30 +407,28 @@ impl SourceWindow {
                 let fl = (((90.0 - lat) * ppd) - self.line0 as f64) / self.step as f64;
                 let (l0, lf) = split(fl, self.lines);
 
-                (0..grid_width)
-                    .map(|gx| {
-                        let u = if grid_width > 1 {
-                            gx as f64 / (grid_width - 1) as f64
-                        } else {
-                            0.0
-                        };
-                        let lon = lon_w + (lon_e - lon_w) * u;
-                        let fs = ((lon * ppd) - self.samp0 as f64) / self.step as f64;
-                        let (s0, sf) = split(fs, self.samples);
+                for (gx, cell) in row.iter_mut().enumerate() {
+                    let u = if grid_width > 1 {
+                        gx as f64 / (grid_width - 1) as f64
+                    } else {
+                        0.0
+                    };
+                    let lon = lon_w + (lon_e - lon_w) * u;
+                    let fs = ((lon * ppd) - self.samp0 as f64) / self.step as f64;
+                    let (s0, sf) = split(fs, self.samples);
 
-                        let v = bilinear(
-                            at(l0, s0),
-                            at(l0, s0 + 1),
-                            at(l0 + 1, s0),
-                            at(l0 + 1, s0 + 1),
-                            sf,
-                            lf,
-                        );
-                        v as f64 * gain
-                    })
-                    .collect()
-            })
-            .collect()
+                    let v = bilinear(
+                        at(l0, s0),
+                        at(l0, s0 + 1),
+                        at(l0 + 1, s0),
+                        at(l0 + 1, s0 + 1),
+                        sf,
+                        lf,
+                    );
+                    *cell = v as f64 * gain;
+                }
+            });
+        Ok(grid)
     }
 }
 

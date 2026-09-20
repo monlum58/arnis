@@ -166,6 +166,10 @@ fn run_cli() {
 
                           version {}
                 {}
+
+          monlum58's fork — adds bounded-memory large-area generation
+          (metro-scale bboxes without hitting the RAM limit) and --name.
+          Original Arnis by Louis Erbkamm: https://github.com/louis-e/arnis
         "#,
         version,
         repository.bright_white().bold()
@@ -331,7 +335,8 @@ fn run_cli() {
     } else {
         // Java: create a new world in the provided output directory
         let base_dir = args.path.clone().unwrap();
-        let world_path = match world_utils::create_new_world(&base_dir) {
+        let world_path = match world_utils::create_new_world_with_name(&base_dir, args.name.as_deref())
+        {
             Ok(path) => PathBuf::from(path),
             Err(e) => {
                 eprintln!("{} {}", "Error:".red().bold(), e);

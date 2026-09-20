@@ -5,6 +5,7 @@ use std::collections::{HashMap, VecDeque};
 use crate::bresenham::bresenham_line;
 use crate::clipping::clip_water_ring_to_bbox;
 use crate::coordinate_system::cartesian::XZBBox;
+use crate::elevation::MmapGrid;
 use crate::land_cover::{compute_water_distance, LandCoverData, LC_WATER};
 use crate::osm_parser::{
     ProcessedElement, ProcessedMemberRole, ProcessedNode, ProcessedRelation, ProcessedWay,
@@ -25,7 +26,7 @@ struct WaterContext {
 
 pub fn apply_osm_water_override(
     land_cover: &mut LandCoverData,
-    heights: &mut [Vec<f32>],
+    heights: &mut MmapGrid<f32>,
     world_width: usize,
     world_height: usize,
     elements: &[ProcessedElement],
@@ -54,7 +55,7 @@ pub fn apply_osm_water_override(
         scale_to_grid_x,
         scale_to_grid_z,
     );
-    let heights: &mut [Vec<f32>] = heights;
+    let heights: &mut MmapGrid<f32> = heights;
 
     let mut changed: usize = 0;
     for elem in elements {
@@ -265,7 +266,7 @@ fn fill_polygon_scanline(
     grid: &mut [Vec<u8>],
     outers: &[&[(i32, i32)]],
     inners: &[&[(i32, i32)]],
-    heights: &[Vec<f32>],
+    heights: &MmapGrid<f32>,
     context: Option<&WaterContext>,
     min_x_world: i32,
     min_z_world: i32,
@@ -358,7 +359,7 @@ fn fill_row_spans(
     row: &mut [u8],
     outer_x: &[f64],
     inner_x: &[f64],
-    heights: &[Vec<f32>],
+    heights: &MmapGrid<f32>,
     context: Option<&WaterContext>,
     gz: usize,
     min_x_world: i32,
@@ -443,7 +444,7 @@ fn rasterize_line(
     grid: &mut [Vec<u8>],
     nodes: &[ProcessedNode],
     half_width: i32,
-    heights: &[Vec<f32>],
+    heights: &MmapGrid<f32>,
     context: Option<&WaterContext>,
     min_x_world: i32,
     min_z_world: i32,
@@ -510,7 +511,7 @@ fn rasterize_line(
 // Returns None when there are no ESA water cells, disabling the guard.
 fn build_water_context(
     grid: &[Vec<u8>],
-    heights: &[Vec<f32>],
+    heights: &MmapGrid<f32>,
     width: usize,
     height: usize,
     scale_to_grid_x: f64,
@@ -686,7 +687,7 @@ fn build_protected_land_bitset(
 // Multi-source BFS: each cell gets the terrain Y of its nearest LC_WATER seed.
 fn compute_nearest_water_y(
     grid: &[Vec<u8>],
-    heights: &[Vec<f32>],
+    heights: &MmapGrid<f32>,
     width: usize,
     height: usize,
 ) -> Vec<Vec<f32>> {
@@ -731,7 +732,7 @@ fn compute_nearest_water_y(
 
 #[inline]
 fn passes_water_guard(
-    heights: &[Vec<f32>],
+    heights: &MmapGrid<f32>,
     context: Option<&WaterContext>,
     gx: usize,
     gz: usize,
@@ -782,7 +783,7 @@ mod tests {
         let bbox = XZBBox::rect_from_min_max(0, 0, 15, 15).unwrap();
         // 16x16 grid over 16x16 world: scale factors are exactly 1.
         let mut grid = vec![vec![0u8; 16]; 16];
-        let heights = vec![vec![0.0f32; 16]; 16];
+        let heights = MmapGrid::new(16, 16).unwrap();
         let ring = vec![
             node(1, 8, 4),
             node(2, 30, 4),
@@ -820,7 +821,7 @@ mod tests {
 
     #[test]
     fn crossing_pair_fills_span() {
-        let heights = vec![vec![0.0f32; 16]];
+        let heights = MmapGrid::new(1, 16).unwrap();
         let mut row = vec![0u8; 16];
         let n = fill_row_spans(
             &mut row,

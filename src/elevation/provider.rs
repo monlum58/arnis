@@ -1,10 +1,11 @@
 use crate::coordinate_system::geographic::LLBBox;
+use crate::elevation::MmapGrid;
 
 /// Raw elevation grid in meters, before any Minecraft-specific processing.
 /// NaN values indicate missing data that will be filled by post-processing.
 pub struct RawElevationGrid {
     /// Height values in meters above sea level. NaN for missing data.
-    pub heights_meters: Vec<Vec<f64>>,
+    pub heights_meters: MmapGrid<f64>,
 }
 
 /// Trait for elevation data providers.

@@ -1,8 +1,11 @@
 pub mod cache;
+pub mod mmap_grid;
 pub mod postprocess;
 pub mod provider;
 pub mod providers;
 pub mod selector;
+
+pub use mmap_grid::MmapGrid;
 
 use crate::{
     coordinate_system::{geographic::LLBBox, transformation::geo_distance},
@@ -27,7 +30,7 @@ pub struct ElevationData {
     /// grid that can easily hit 10+ million cells on a city-sized bbox
     /// (≈80 MB at f64, halved at f32). Postprocess still runs in f64 for
     /// numerical stability; the downcast happens once at construction.
-    pub(crate) heights: Vec<Vec<f32>>,
+    pub(crate) heights: MmapGrid<f32>,
     /// Width of the elevation grid (may be smaller than world width due to capping)
     pub(crate) width: usize,
     /// Height of the elevation grid (may be smaller than world height due to capping)
@@ -242,19 +245,25 @@ pub fn fetch_elevation_data(
         }
     }
 
-    // Downcast the f64 postprocess output to the f32 storage format. One-time
-    // cost paid here so the large grid sits at half the memory for the rest
-    // of the generation run. NaN/infinity preservation is a requirement —
-    // downstream `is_finite` checks rely on non-finite sentinels surviving.
-    let mc_heights_f32: Vec<Vec<f32>> = mc_heights
-        .into_iter()
-        .map(|row| row.into_iter().map(|v| v as f32).collect())
-        .collect();
+    // Downcast the f64 postprocess output to the f32 storage format and write
+    // it straight into the mmap-backed grid row by row (never materializing a
+    // full f32 `Vec<Vec<f32>>` in addition to the f64 source), so the large
+    // grid sits at half the memory for the rest of the run and is backed by
+    // reclaimable pages rather than pinned heap. NaN/infinity preservation is
+    // a requirement — downstream `is_finite` checks rely on non-finite
+    // sentinels surviving.
+    let mut mc_heights_grid =
+        MmapGrid::new(grid_height, grid_width).expect("elevation grid: mmap alloc");
+    for (y, row) in mc_heights.iter().enumerate() {
+        for (x, &v) in row.iter().enumerate() {
+            mc_heights_grid[y][x] = v as f32;
+        }
+    }
     bench.mark("elev_downcast");
     emit_gui_progress_update(18.0, "Processing elevation...");
 
     Ok(ElevationData {
-        heights: mc_heights_f32,
+        heights: mc_heights_grid,
         width: grid_width,
         height: grid_height,
         world_width,
@@ -337,7 +346,7 @@ fn fetch_raw_with_fallback(
 }
 
 /// Compute the fraction of NaN/non-finite values in a height grid (0.0 to 1.0).
-fn compute_nan_ratio(heights: &[Vec<f64>]) -> f64 {
+fn compute_nan_ratio(heights: &MmapGrid<f64>) -> f64 {
     let mut total = 0usize;
     let mut nan_count = 0usize;
     for row in heights {

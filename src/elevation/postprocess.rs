@@ -1,3 +1,4 @@
+use crate::elevation::MmapGrid;
 use crate::land_cover::{LandCoverData, LC_BUILT_UP, LC_WATER};
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -36,7 +37,7 @@ const MIN_PERCHED_FRACTION: f64 = 0.10;
 /// `m_per_cell` keeps the erosion reach at a constant physical scale: the window is
 /// cell-based, so at tens of metres per cell (a capped grid, or a very low `--scale`)
 /// the default 10 passes eat real landforms hundreds of metres across.
-pub fn repair_terrain_anomalies(heights: &mut [Vec<f64>], m_per_cell: f64) {
+pub fn repair_terrain_anomalies(heights: &mut MmapGrid<f64>, m_per_cell: f64) {
     let grid_h = heights.len();
     if grid_h < 5 {
         return;
@@ -55,26 +56,24 @@ pub fn repair_terrain_anomalies(heights: &mut [Vec<f64>], m_per_cell: f64) {
     let passes = if m_per_cell > 4.0 { 2 } else { 10 };
 
     let r = RADIUS as usize;
-    // Reuse the snapshot buffer across passes (saves ~128 MB/pass of allocs
-    // on a 4096² grid). The inner `clone_from` copies in place.
-    let mut snapshot: Vec<Vec<f64>> = heights.to_vec();
+    // Reuse the snapshot buffer across passes (mmap-backed, so its pages are
+    // reclaimable page cache rather than pinned heap — the same 4096² grid
+    // that used to cost ~128 MB/pass of anonymous memory now costs the OS
+    // nothing it can't get back under pressure). `clone_from` copies the
+    // whole mapping in one memcpy rather than a per-row parallel loop.
+    let mut snapshot = heights.clone();
     let mut total_repaired = 0usize;
     let mut passes_ran = 0usize;
 
     for pass in 0..passes {
         if pass > 0 {
-            // Refresh the snapshot to last pass's writes — also done in
-            // parallel because both sides are large contiguous allocs and
-            // the row-pair copy is independent.
-            snapshot
-                .par_iter_mut()
-                .zip(heights.par_iter())
-                .for_each(|(dst, src)| dst.clone_from(src));
+            // Refresh the snapshot to last pass's writes, in place.
+            snapshot.clone_from(heights);
         }
 
         // Stream writes directly into `heights` per row in parallel, reading
         // from the immutable snapshot. Avoids buffering all changes in a Vec.
-        let snapshot_ref: &[Vec<f64>] = &snapshot;
+        let snapshot_ref: &MmapGrid<f64> = &snapshot;
         let repaired: usize = heights
             .par_iter_mut()
             .enumerate()
@@ -171,7 +170,7 @@ pub fn repair_terrain_anomalies(heights: &mut [Vec<f64>], m_per_cell: f64) {
 /// building-height bias at the waterfront that a Gaussian alone would turn
 /// into a visible "rising ramp" between water and the city interior.
 pub fn apply_land_cover_repair(
-    heights: &mut [Vec<f64>],
+    heights: &mut MmapGrid<f64>,
     land_cover: &mut LandCoverData,
     built_up_sigma_cells: f64,
     coastal_pull_distance_cells: u32,
@@ -276,7 +275,7 @@ pub fn apply_land_cover_repair(
 /// so the coastal pull-down and Gaussian source-masking operate on the
 /// real water surface rather than the ESA classification.
 fn level_water_surfaces(
-    heights: &mut [Vec<f64>],
+    heights: &mut MmapGrid<f64>,
     lc_grid: &[Vec<u8>],
     m_per_cell: f64,
 ) -> Vec<Vec<bool>> {
@@ -323,7 +322,7 @@ fn level_water_surfaces(
 
     // Snapshot for reading so local-median / mode / clamp computations never
     // see already-mutated heights from the current pass.
-    let heights_snapshot: Vec<Vec<f64>> = heights.to_vec();
+    let heights_snapshot: MmapGrid<f64> = heights.clone();
 
     let mut components_leveled = 0usize;
     let mut still_components = 0usize;
@@ -584,6 +583,7 @@ fn smooth_sparse_field(cells: &[(u32, u32, f32)], sigma_cells: f64) -> Vec<f64> 
                 .collect()
         })
         .collect();
+    let coarse = MmapGrid::from_rows(coarse).expect("smooth_sparse_field: mmap alloc");
     let blurred = gaussian_blur_grid(&coarse, sigma_cells / step as f64);
 
     cells
@@ -643,7 +643,7 @@ fn interquartile_range(values: &[f64]) -> f64 {
 /// per-cell water surface that follows the river's gradient at scales
 /// longer than the radius, while still averaging out local DSM noise.
 fn local_water_median(
-    heights: &[Vec<f64>],
+    heights: &MmapGrid<f64>,
     lc_grid: &[Vec<u8>],
     cx: usize,
     cy: usize,
@@ -686,7 +686,7 @@ fn local_water_median(
 
 /// Lowest finite height among the cell's non-water 4-neighbours, if it has any.
 fn lowest_adjacent_land(
-    heights: &[Vec<f64>],
+    heights: &MmapGrid<f64>,
     lc_grid: &[Vec<u8>],
     x: usize,
     y: usize,
@@ -797,7 +797,7 @@ fn histogram_mode(values: &[f64], bin_size: f64) -> f64 {
 fn clamp_by_adjacent_land(
     proposed: f64,
     component: &[(usize, usize)],
-    heights: &[Vec<f64>],
+    heights: &MmapGrid<f64>,
     lc_grid: &[Vec<u8>],
 ) -> f64 {
     let h = heights.len();
@@ -891,7 +891,7 @@ fn nearest_non_water_class(lc_grid: &[Vec<u8>], x: usize, y: usize, radius: i32)
 /// real watercourse fails both: its surface follows a gentle grade and its banks rise.
 /// Dropped cells take the nearest land class. Returns cells reclassified.
 fn drop_water_on_steep_terrain(
-    heights: &[Vec<f64>],
+    heights: &MmapGrid<f64>,
     lc_grid: &mut [Vec<u8>],
     m_per_cell: f64,
 ) -> usize {
@@ -1138,7 +1138,7 @@ fn reclassify_non_surface_water_cells(
 
 // Linearly pull land cells within max_distance toward the local water surface; skip > MAX_PULL_DROP_M above water (real cliffs).
 fn pull_coastal_land_toward_water(
-    heights: &mut [Vec<f64>],
+    heights: &mut MmapGrid<f64>,
     is_water_surface: &[Vec<bool>],
     max_distance: u32,
 ) {
@@ -1242,7 +1242,7 @@ fn pull_coastal_land_toward_water(
 /// skip the whole pass in that case (e.g. on coarse AWS fallback where the
 /// native resolution already exceeds our target smoothing scale).
 fn smooth_built_up_gaussian(
-    heights: &mut [Vec<f64>],
+    heights: &mut MmapGrid<f64>,
     lc_grid: &[Vec<u8>],
     is_water_surface: &[Vec<bool>],
     sigma_cells: f64,
@@ -1317,7 +1317,7 @@ fn smooth_built_up_gaussian(
 /// 2D Gaussian blur (separable: horizontal then vertical pass).
 /// Edges are handled by renormalizing weights over the valid samples so the
 /// blur doesn't darken the border of the grid.
-pub(crate) fn gaussian_blur_grid(grid: &[Vec<f64>], sigma: f64) -> Vec<Vec<f64>> {
+pub(crate) fn gaussian_blur_grid(grid: &MmapGrid<f64>, sigma: f64) -> MmapGrid<f64> {
     gaussian_blur_grid_reported(grid, sigma, &|_| {})
 }
 
@@ -1328,85 +1328,71 @@ pub(crate) fn gaussian_blur_grid(grid: &[Vec<f64>], sigma: f64) -> Vec<Vec<f64>>
 /// can be reported between them — both axes stay fully independent, so the
 /// result is identical to processing them all at once.
 fn gaussian_blur_grid_reported(
-    grid: &[Vec<f64>],
+    grid: &MmapGrid<f64>,
     sigma: f64,
     report: &dyn Fn(f64),
-) -> Vec<Vec<f64>> {
+) -> MmapGrid<f64> {
     let kernel_size: usize = (sigma * 3.0).ceil() as usize * 2 + 1;
     let kernel = create_gaussian_kernel(kernel_size, sigma);
     let half = kernel_size as i32 / 2;
 
     let h = grid.len();
-    if h == 0 {
-        return Vec::new();
-    }
-    let w = grid[0].len();
-    if w == 0 {
-        return vec![Vec::new(); h];
+    let w = if h == 0 { 0 } else { grid[0].len() };
+    let mut after_h = MmapGrid::<f64>::new(h, w).expect("gaussian blur grid: mmap alloc");
+    if h == 0 || w == 0 {
+        return after_h;
     }
 
-    let row_chunk = h.div_ceil(BLUR_CHUNKS);
-    let mut after_h: Vec<Vec<f64>> = Vec::with_capacity(h);
-    for rows in grid.chunks(row_chunk) {
-        let mut part: Vec<Vec<f64>> = rows
-            .par_iter()
-            .map(|row| blur_line(row.len(), &kernel, half, |i| row[i]))
-            .collect();
-        after_h.append(&mut part);
-        report(0.5 * (after_h.len() as f64 / h as f64));
-    }
-
-    gaussian_blur_vertical_in_place(&mut after_h, &kernel, half, w, report);
-    after_h
+    blur_rows_into(grid, &mut after_h, &kernel, half, &|f| report(0.5 * f));
+    blur_vertical_via_transpose(&after_h, &kernel, half, &|f| report(0.5 + 0.5 * f))
 }
 
 /// `gaussian_blur_grid_reported` over `heights` with every `masked` cell read as NaN,
 /// so it contributes nothing. Identical output to blurring a pre-built masked copy,
 /// without allocating one.
 fn gaussian_blur_heights_masked(
-    heights: &[Vec<f64>],
+    heights: &MmapGrid<f64>,
     masked: &[Vec<bool>],
     sigma: f64,
     report: &dyn Fn(f64),
-) -> Vec<Vec<f64>> {
+) -> MmapGrid<f64> {
     let kernel_size: usize = (sigma * 3.0).ceil() as usize * 2 + 1;
     let kernel = create_gaussian_kernel(kernel_size, sigma);
     let half = kernel_size as i32 / 2;
 
     let h = heights.len().min(masked.len());
-    if h == 0 {
-        return Vec::new();
-    }
-    let w = heights[0].len().min(masked[0].len());
-    if w == 0 {
-        return vec![Vec::new(); h];
+    let w = if h == 0 {
+        0
+    } else {
+        heights[0].len().min(masked[0].len())
+    };
+    let mut after_h = MmapGrid::<f64>::new(h, w).expect("gaussian blur grid: mmap alloc");
+    if h == 0 || w == 0 {
+        return after_h;
     }
 
     let row_chunk = h.div_ceil(BLUR_CHUNKS);
-    let mut after_h: Vec<Vec<f64>> = Vec::with_capacity(h);
     let mut y0 = 0usize;
     while y0 < h {
         let y1 = (y0 + row_chunk).min(h);
-        let mut part: Vec<Vec<f64>> = (y0..y1)
-            .into_par_iter()
-            .map(|y| {
+        let dest = &mut after_h.as_flat_mut_slice()[y0 * w..y1 * w];
+        dest.par_chunks_mut(w)
+            .zip((y0..y1).into_par_iter())
+            .for_each(|(dest_row, y)| {
                 let (row, m_row) = (&heights[y], &masked[y]);
                 let len = row.len().min(m_row.len());
-                blur_line(
+                dest_row[..len].copy_from_slice(&blur_line(
                     len,
                     &kernel,
                     half,
                     |i| if m_row[i] { f64::NAN } else { row[i] },
-                )
-            })
-            .collect();
-        after_h.append(&mut part);
+                ));
+            });
         y0 = y1;
-        report(0.5 * (after_h.len() as f64 / h as f64));
+        report(0.5 * (y1 as f64 / h as f64));
     }
 
-    gaussian_blur_vertical_in_place(&mut after_h, &kernel, half, w, report);
-    after_h
+    blur_vertical_via_transpose(&after_h, &kernel, half, &|f| report(0.5 + 0.5 * f))
 }
 
 /// ~10 chunks per pass: enough to animate the bar, few enough that the extra
@@ -1442,40 +1428,64 @@ fn blur_line(len: usize, kernel: &[f64], half: i32, get: impl Fn(usize) -> f64) 
         .collect()
 }
 
-/// Vertical half of the separable blur, written back over the horizontal result.
-/// Every column is copied out before it is computed and only reads its own column, and
-/// a chunk's writes land after all of its columns have been read, so nothing reads a
-/// cell that was already overwritten and no second full-grid buffer is needed.
-fn gaussian_blur_vertical_in_place(
-    after_h: &mut [Vec<f64>],
+/// Blurs every row of `src` independently into a same-shape `dest`, in row
+/// chunks (so `report` can advance a progress bar between them — both are
+/// disjoint parallel writes either way, so this changes nothing about the
+/// result). Shared by the horizontal pass and, after a transpose, the
+/// vertical pass below: a "row" of the transposed grid is a column of the
+/// original, so the same sequential-read/sequential-write disk access
+/// pattern applies to both directions.
+fn blur_rows_into(
+    src: &MmapGrid<f64>,
+    dest: &mut MmapGrid<f64>,
     kernel: &[f64],
     half: i32,
-    w: usize,
     report: &dyn Fn(f64),
 ) {
-    let col_chunk = w.div_ceil(BLUR_CHUNKS);
-    let mut x0 = 0usize;
-    while x0 < w {
-        let x1 = (x0 + col_chunk).min(w);
-        let blurred: Vec<(usize, Vec<f64>)> = {
-            let src: &[Vec<f64>] = after_h;
-            (x0..x1)
-                .into_par_iter()
-                .map(|x| {
-                    let column: Vec<f64> = src.iter().map(|row| row[x]).collect();
-                    let col = blur_line(column.len(), kernel, half, |i| column[i]);
-                    (x, col)
-                })
-                .collect()
-        };
-        for (x, col) in blurred {
-            for (y, v) in col.into_iter().enumerate() {
-                after_h[y][x] = v;
-            }
-        }
-        x0 = x1;
-        report(0.5 + 0.5 * (x0 as f64 / w as f64));
+    let h = src.len();
+    if h == 0 {
+        return;
     }
+    let w = src[0].len();
+    if w == 0 {
+        return;
+    }
+    let row_chunk = h.div_ceil(BLUR_CHUNKS);
+    let mut y0 = 0usize;
+    while y0 < h {
+        let y1 = (y0 + row_chunk).min(h);
+        let dst = &mut dest.as_flat_mut_slice()[y0 * w..y1 * w];
+        dst.par_chunks_mut(w)
+            .zip((y0..y1).into_par_iter())
+            .for_each(|(dest_row, y)| {
+                let row = &src[y];
+                dest_row.copy_from_slice(&blur_line(row.len(), kernel, half, |i| row[i]));
+            });
+        y0 = y1;
+        report(y1 as f64 / h as f64);
+    }
+}
+
+/// Vertical half of the separable blur, via a blocked transpose rather than
+/// striding through the whole grid once per output column. Reading a
+/// "column" of a row-major matrix touches one value per row spread across
+/// the entire backing file — for a disk-backed grid at metro scale that
+/// means rereading gigabytes of data per call (this is what made this pass
+/// crawl for hours under real memory pressure in practice). Transposing
+/// turns the vertical pass into the same disk-friendly row-blur the
+/// horizontal pass already does; `MmapGrid::transpose` bounds its own
+/// working set to one small tile at a time for exactly this reason.
+fn blur_vertical_via_transpose(
+    after_h: &MmapGrid<f64>,
+    kernel: &[f64],
+    half: i32,
+    report: &dyn Fn(f64),
+) -> MmapGrid<f64> {
+    let transposed = after_h.transpose();
+    let mut blurred_transposed = MmapGrid::<f64>::new(transposed.len(), transposed.cols())
+        .expect("gaussian blur vertical: mmap alloc");
+    blur_rows_into(&transposed, &mut blurred_transposed, kernel, half, report);
+    blurred_transposed.transpose()
 }
 
 /// Blur a binary `grid == target` mask straight to f32. Same kernel and f64
@@ -1489,7 +1499,7 @@ pub(crate) fn gaussian_blur_mask_to_f32(
     width: usize,
     height: usize,
     sigma: f64,
-) -> Vec<Vec<f32>> {
+) -> MmapGrid<f32> {
     gaussian_blur_mask_to_f32_reported(grid, target, width, height, sigma, &|_| {})
 }
 
@@ -1502,103 +1512,67 @@ pub(crate) fn gaussian_blur_mask_to_f32_reported(
     height: usize,
     sigma: f64,
     report: &dyn Fn(f64),
-) -> Vec<Vec<f32>> {
+) -> MmapGrid<f32> {
     let kernel_size: usize = (sigma * 3.0).ceil() as usize * 2 + 1;
     let kernel = create_gaussian_kernel(kernel_size, sigma);
     let half = kernel_size as i32 / 2;
 
     let h = grid.len().min(height);
-    if h == 0 {
-        return Vec::new();
-    }
-    let w = grid[0].len().min(width);
-    if w == 0 {
-        return vec![Vec::new(); h];
+    let w = if h == 0 { 0 } else { grid[0].len().min(width) };
+    let mut out = MmapGrid::<f32>::new(h, w).expect("gaussian blur mask: mmap alloc");
+    if h == 0 || w == 0 {
+        return out;
     }
 
     const CHUNKS: usize = 10;
 
     // Horizontal pass: rows are independent, mask read on the fly.
     let row_chunk = h.div_ceil(CHUNKS);
-    let mut after_h: Vec<Vec<f64>> = Vec::with_capacity(h);
+    let mut after_h = MmapGrid::<f64>::new(h, w).expect("gaussian blur mask: mmap alloc");
+    let mut y0 = 0usize;
     for rows in grid[..h].chunks(row_chunk) {
-        let mut part: Vec<Vec<f64>> = rows
-            .par_iter()
-            .map(|row| {
-                let len = row.len().min(width);
+        let y1 = (y0 + rows.len()).min(h);
+        let dest = &mut after_h.as_flat_mut_slice()[y0 * w..y1 * w];
+        dest.par_chunks_mut(w)
+            .zip(rows.par_iter())
+            .for_each(|(dest_row, row)| {
+                let len = row.len().min(width).min(w);
                 let row_len = len as i32;
-                (0..len)
-                    .map(|i| {
-                        let mut sum = 0.0;
-                        let mut wsum = 0.0;
-                        for (j, &k) in kernel.iter().enumerate() {
-                            let idx = i as i32 + j as i32 - half;
-                            if idx >= 0 && idx < row_len {
-                                let v = if row[idx as usize] == target {
-                                    1.0
-                                } else {
-                                    0.0
-                                };
-                                sum += v * k;
-                                wsum += k;
-                            }
+                for (i, cell) in dest_row.iter_mut().enumerate().take(len) {
+                    let mut sum = 0.0;
+                    let mut wsum = 0.0;
+                    for (j, &k) in kernel.iter().enumerate() {
+                        let idx = i as i32 + j as i32 - half;
+                        if idx >= 0 && idx < row_len {
+                            let v = if row[idx as usize] == target {
+                                1.0
+                            } else {
+                                0.0
+                            };
+                            sum += v * k;
+                            wsum += k;
                         }
-                        if wsum > 0.0 {
-                            sum / wsum
-                        } else {
-                            f64::NAN
-                        }
-                    })
-                    .collect()
-            })
-            .collect();
-        after_h.append(&mut part);
-        report(0.5 * (after_h.len() as f64 / h as f64));
+                    }
+                    *cell = if wsum > 0.0 { sum / wsum } else { f64::NAN };
+                }
+            });
+        y0 = y1;
+        report(0.5 * (y0 as f64 / h as f64));
     }
 
-    // Vertical pass: f64 throughout, cast only on store.
-    let col_chunk = w.div_ceil(CHUNKS);
-    let mut out: Vec<Vec<f32>> = vec![vec![0.0; w]; h];
-    let mut x0 = 0usize;
-    while x0 < w {
-        let x1 = (x0 + col_chunk).min(w);
-        let blurred: Vec<(usize, Vec<f32>)> = (x0..x1)
-            .into_par_iter()
-            .map(|x| {
-                let column: Vec<f64> = after_h.iter().map(|row| row[x]).collect();
-                let col_len = column.len() as i32;
-                let col: Vec<f32> = (0..column.len())
-                    .map(|y| {
-                        let mut sum = 0.0;
-                        let mut wsum = 0.0;
-                        for (j, &k) in kernel.iter().enumerate() {
-                            let idx = y as i32 + j as i32 - half;
-                            if idx >= 0 && idx < col_len {
-                                let v = column[idx as usize];
-                                if v.is_finite() {
-                                    sum += v * k;
-                                    wsum += k;
-                                }
-                            }
-                        }
-                        if wsum > 0.0 {
-                            (sum / wsum) as f32
-                        } else {
-                            f64::NAN as f32
-                        }
-                    })
-                    .collect();
-                (x, col)
-            })
-            .collect();
-        for (x, col) in blurred {
-            for (y, v) in col.into_iter().enumerate() {
-                out[y][x] = v;
+    // Vertical pass: f64 throughout (via transpose, same as the other blur
+    // variants), cast to f32 only in the final sequential copy below.
+    let blurred = blur_vertical_via_transpose(&after_h, &kernel, half, &|f| {
+        report(0.5 + 0.5 * f)
+    });
+    out.as_flat_mut_slice()
+        .par_chunks_mut(w.max(1))
+        .zip(blurred.par_iter())
+        .for_each(|(dest_row, src_row)| {
+            for (dest, &v) in dest_row.iter_mut().zip(src_row.iter()) {
+                *dest = v as f32;
             }
-        }
-        x0 = x1;
-        report(0.5 + 0.5 * (x0 as f64 / w as f64));
-    }
+        });
     out
 }
 
@@ -1623,7 +1597,7 @@ fn create_gaussian_kernel(size: usize, sigma: f64) -> Vec<f64> {
 /// Within one iteration each row's writes only depend on the read-only snapshot,
 /// so the row sweep is parallelised. The convergence loop itself stays serial
 /// because each iteration's snapshot must include the previous iteration's fills.
-pub fn fill_nan_values(height_grid: &mut [Vec<f64>]) {
+pub fn fill_nan_values(height_grid: &mut MmapGrid<f64>) {
     let height: usize = height_grid.len();
     if height == 0 {
         return;
@@ -1638,9 +1612,9 @@ pub fn fill_nan_values(height_grid: &mut [Vec<f64>]) {
     }
 
     // One snapshot buffer for the whole loop; refreshed in place per iteration.
-    let mut snapshot: Vec<Vec<f64>> = height_grid.to_vec();
+    let mut snapshot = height_grid.clone();
     loop {
-        let snapshot_ref: &[Vec<f64>] = &snapshot;
+        let snapshot_ref: &MmapGrid<f64> = &snapshot;
 
         let any_changed = height_grid
             .par_iter_mut()
@@ -1678,10 +1652,7 @@ pub fn fill_nan_values(height_grid: &mut [Vec<f64>]) {
         if !any_changed {
             break;
         }
-        snapshot
-            .par_iter_mut()
-            .zip(height_grid.par_iter())
-            .for_each(|(dst, src)| dst.clone_from(src));
+        snapshot.clone_from(height_grid);
     }
 }
 
@@ -1693,7 +1664,7 @@ pub fn fill_nan_values(height_grid: &mut [Vec<f64>]) {
 /// corruption and gets levelled. Isolated spikes are `repair_terrain_anomalies`' job.
 /// The bounds sit outside the real range (Dead Sea shore ~-430 m, Everest 8849 m) with
 /// enough margin for providers that report ellipsoidal instead of orthometric heights.
-pub fn filter_elevation_outliers(height_grid: &mut [Vec<f64>]) {
+pub fn filter_elevation_outliers(height_grid: &mut MmapGrid<f64>) {
     const MIN_REASONABLE_M: f64 = -500.0;
     const MAX_REASONABLE_M: f64 = 9000.0;
 
@@ -1742,13 +1713,13 @@ pub fn filter_elevation_outliers(height_grid: &mut [Vec<f64>]) {
 /// the relief genuinely does not fit above `ground_level`, so a small bbox is not dropped
 /// into the basement just because the world floor was extended.
 pub fn scale_to_minecraft(
-    blurred_heights: &[Vec<f64>],
+    blurred_heights: &MmapGrid<f64>,
     scale: f64,
     ground_level: i32,
     min_ground_level: i32,
     disable_height_limit: bool,
     extended_max_y: i32,
-) -> (Vec<Vec<f64>>, f64, f64, i32) {
+) -> (MmapGrid<f64>, f64, f64, i32) {
     // Derive min/max
     let (min_height, max_height) = blurred_heights
         .par_iter()
@@ -1830,23 +1801,25 @@ pub fn scale_to_minecraft(
         compressed_range
     };
 
-    let mc_heights: Vec<Vec<f64>> = blurred_heights
-        .par_iter()
-        .map(|row| {
-            row.iter()
-                .map(|&h| {
-                    let relative_height: f64 = if height_range > 0.0 {
-                        (h - min_height) / height_range
-                    } else {
-                        0.0
-                    };
-                    let scaled_height: f64 = relative_height * scaled_range;
-                    let mc_y = ground_level as f64 + scaled_height;
-                    mc_y.clamp(ground_level as f64, upper_clamp)
-                })
-                .collect()
-        })
-        .collect();
+    let h = blurred_heights.len();
+    let w = if h == 0 { 0 } else { blurred_heights[0].len() };
+    let mut mc_heights = MmapGrid::<f64>::new(h, w).expect("scale_to_minecraft: mmap alloc");
+    mc_heights
+        .as_flat_mut_slice()
+        .par_chunks_mut(w.max(1))
+        .zip(blurred_heights.par_iter())
+        .for_each(|(dest_row, src_row)| {
+            for (dest, &h) in dest_row.iter_mut().zip(src_row.iter()) {
+                let relative_height: f64 = if height_range > 0.0 {
+                    (h - min_height) / height_range
+                } else {
+                    0.0
+                };
+                let scaled_height: f64 = relative_height * scaled_range;
+                let mc_y = ground_level as f64 + scaled_height;
+                *dest = mc_y.clamp(ground_level as f64, upper_clamp);
+            }
+        });
 
     let blocks_per_meter = if height_range > 0.0 {
         scaled_range / height_range
@@ -1884,9 +1857,10 @@ mod mask_blur_tests {
                     .collect()
             })
             .collect();
+        let binary = MmapGrid::from_rows(binary).unwrap();
         gaussian_blur_grid(&binary, sigma)
-            .into_iter()
-            .map(|row| row.into_iter().map(|v| v as f32).collect())
+            .iter()
+            .map(|row| row.iter().map(|&v| v as f32).collect())
             .collect()
     }
 
@@ -1936,11 +1910,14 @@ mod tests {
 
     /// 200x200 m grid at 1 m/cell: a hillside rising 0.6 m per metre along
     /// x (31 degrees) with land everywhere.
-    fn hillside(n: usize) -> (Vec<Vec<f64>>, Vec<Vec<u8>>) {
+    fn hillside(n: usize) -> (MmapGrid<f64>, Vec<Vec<u8>>) {
         let heights = (0..n)
             .map(|_| (0..n).map(|x| x as f64 * 0.6).collect())
             .collect();
-        (heights, vec![vec![LC_GRASSLAND; n]; n])
+        (
+            MmapGrid::from_rows(heights).unwrap(),
+            vec![vec![LC_GRASSLAND; n]; n],
+        )
     }
 
     #[test]
@@ -1985,6 +1962,7 @@ mod tests {
                 }
             }
         }
+        let heights = MmapGrid::from_rows(heights).unwrap();
         let dropped = drop_water_on_steep_terrain(&heights, &mut lc, 1.0);
         assert_eq!(dropped, 0);
         assert_eq!(lc[100][100], LC_WATER);
@@ -2005,6 +1983,7 @@ mod tests {
                     .collect()
             })
             .collect();
+        let heights = MmapGrid::from_rows(heights).unwrap();
         let mut lc = vec![vec![LC_GRASSLAND; n]; n];
         for row in lc.iter_mut().take(206).skip(195) {
             for c in row.iter_mut() {
@@ -2063,6 +2042,7 @@ mod tests {
                     .collect()
             })
             .collect();
+        let heights = MmapGrid::from_rows(heights).unwrap();
         let mut lc = vec![vec![LC_GRASSLAND; n]; n];
         for row in lc.iter_mut().take(111).skip(90) {
             for c in row.iter_mut() {
@@ -2074,7 +2054,7 @@ mod tests {
 
     /// A river 60 m wide running along x across a 400 m grid at 1 m/cell,
     /// with the given surface profile along x; banks rise steeply.
-    fn river(profile: impl Fn(f64) -> f64) -> (Vec<Vec<f64>>, Vec<Vec<u8>>) {
+    fn river(profile: impl Fn(f64) -> f64) -> (MmapGrid<f64>, Vec<Vec<u8>>) {
         let n = 400usize;
         let heights: Vec<Vec<f64>> = (0..n)
             .map(|z| {
@@ -2092,7 +2072,7 @@ mod tests {
                 *c = LC_WATER;
             }
         }
-        (heights, lc)
+        (MmapGrid::from_rows(heights).unwrap(), lc)
     }
 
     #[test]
@@ -2138,8 +2118,8 @@ mod tests {
     }
 
     /// Swiss relief: Lake Maggiore 193 m to Dufourspitze 4634 m.
-    fn swiss_grid() -> Vec<Vec<f64>> {
-        vec![vec![193.0, 4634.0], vec![193.0, 4634.0]]
+    fn swiss_grid() -> MmapGrid<f64> {
+        MmapGrid::from_rows(vec![vec![193.0, 4634.0], vec![193.0, 4634.0]]).unwrap()
     }
 
     #[test]
@@ -2199,7 +2179,7 @@ mod tests {
     fn scale_flat_terrain_keeps_real_min_height() {
         // Zero-relief terrain must still report its true elevation so the snow
         // line can tell a high plateau from a low one.
-        let grid = vec![vec![4500.0_f64; 4]; 4];
+        let grid = MmapGrid::from_rows(vec![vec![4500.0_f64; 4]; 4]).unwrap();
         let (mc, min_m, blocks_per_meter, _base) = scale_to_minecraft(&grid, 1.0, 64, 64, false, 0);
         assert_eq!(min_m, 4500.0);
         assert_eq!(blocks_per_meter, 0.0);
@@ -2210,7 +2190,7 @@ mod tests {
     #[test]
     fn scale_all_nan_grid_min_height_zero() {
         // No finite samples must not leak the f64::MAX reduce sentinel as min.
-        let grid = vec![vec![f64::NAN; 4]; 4];
+        let grid = MmapGrid::from_rows(vec![vec![f64::NAN; 4]; 4]).unwrap();
         let (_mc, min_m, blocks_per_meter, _base) =
             scale_to_minecraft(&grid, 1.0, 64, 64, false, 0);
         assert_eq!(min_m, 0.0);
@@ -2219,11 +2199,12 @@ mod tests {
 
     #[test]
     fn test_fill_nan_values() {
-        let mut grid = vec![
+        let mut grid = MmapGrid::from_rows(vec![
             vec![1.0, f64::NAN, 3.0],
             vec![f64::NAN, f64::NAN, f64::NAN],
             vec![7.0, f64::NAN, 9.0],
-        ];
+        ])
+        .unwrap();
         fill_nan_values(&mut grid);
         for row in &grid {
             for &h in row {
@@ -2232,9 +2213,9 @@ mod tests {
         }
     }
 
-    fn wobbly(w: usize, h: usize) -> Vec<Vec<f64>> {
+    fn wobbly(w: usize, h: usize) -> MmapGrid<f64> {
         let mut s = 0x2545_f491_4f6c_dd1du64;
-        (0..h)
+        let rows: Vec<Vec<f64>> = (0..h)
             .map(|_| {
                 (0..w)
                     .map(|_| {
@@ -2243,10 +2224,11 @@ mod tests {
                     })
                     .collect()
             })
-            .collect()
+            .collect();
+        MmapGrid::from_rows(rows).unwrap()
     }
 
-    fn assert_bits_eq(got: &[Vec<f64>], want: &[Vec<f64>]) {
+    fn assert_bits_eq(got: &MmapGrid<f64>, want: &MmapGrid<f64>) {
         assert_eq!(got.len(), want.len());
         for (y, (a, b)) in got.iter().zip(want.iter()).enumerate() {
             assert_eq!(a.len(), b.len(), "row {y} length");
@@ -2258,7 +2240,7 @@ mod tests {
 
     /// Separable blur written with two buffers and no parallelism, in the same tap
     /// order as the production kernel loop.
-    fn two_buffer_blur(grid: &[Vec<f64>], sigma: f64) -> Vec<Vec<f64>> {
+    fn two_buffer_blur(grid: &MmapGrid<f64>, sigma: f64) -> MmapGrid<f64> {
         let kernel_size: usize = (sigma * 3.0).ceil() as usize * 2 + 1;
         let kernel = create_gaussian_kernel(kernel_size, sigma);
         let half = kernel_size as i32 / 2;
@@ -2286,9 +2268,10 @@ mod tests {
         let after_h: Vec<Vec<f64>> = (0..h)
             .map(|y| (0..w).map(|x| tap(&|i| grid[y][i], w, x)).collect())
             .collect();
-        (0..h)
+        let rows: Vec<Vec<f64>> = (0..h)
             .map(|y| (0..w).map(|x| tap(&|i| after_h[i][x], h, y)).collect())
-            .collect()
+            .collect();
+        MmapGrid::from_rows(rows).unwrap()
     }
 
     #[test]
@@ -2318,6 +2301,7 @@ mod tests {
                     .collect()
             })
             .collect();
+        let materialised = MmapGrid::from_rows(materialised).unwrap();
         assert_bits_eq(
             &gaussian_blur_heights_masked(&heights, &masked, 3.0, &|_| {}),
             &gaussian_blur_grid(&materialised, 3.0),
@@ -2366,6 +2350,7 @@ mod tests {
                 *c = f64::NAN;
             }
         }
+        let mut g = MmapGrid::from_rows(g).unwrap();
         fill_nan_values(&mut g);
         assert!(g.iter().flatten().all(|v| *v == 10.0));
     }
@@ -2378,6 +2363,7 @@ mod tests {
                 *c = 900.0;
             }
         }
+        let mut g = MmapGrid::from_rows(g).unwrap();
         filter_elevation_outliers(&mut g);
         assert_eq!(g[50][50], 900.0);
         assert_eq!(g[0][0], 0.0);
@@ -2385,7 +2371,7 @@ mod tests {
 
     #[test]
     fn only_physically_impossible_elevations_are_gated() {
-        let mut g = vec![vec![100.0f64; 21]; 21];
+        let mut g = MmapGrid::from_rows(vec![vec![100.0f64; 21]; 21]).unwrap();
         g[2][2] = -9999.0;
         g[2][18] = 1.0e38;
         g[18][2] = -600.0;
@@ -2404,7 +2390,7 @@ mod tests {
     }
 
     /// 41x41 plateau at 100 m with a centred square tower of `width` cells at 180 m.
-    fn plateau_with_tower(width: usize) -> Vec<Vec<f64>> {
+    fn plateau_with_tower(width: usize) -> MmapGrid<f64> {
         let mut g = vec![vec![100.0f64; 41]; 41];
         let lo = 20 - width / 2;
         for row in g.iter_mut().skip(lo).take(width) {
@@ -2412,13 +2398,13 @@ mod tests {
                 *c = 180.0;
             }
         }
-        g
+        MmapGrid::from_rows(g).unwrap()
     }
 
     #[test]
     fn anomaly_repair_keeps_its_six_metre_deviation_at_block_resolution() {
         let spike = |d: f64| {
-            let mut g = vec![vec![100.0f64; 21]; 21];
+            let mut g = MmapGrid::from_rows(vec![vec![100.0f64; 21]; 21]).unwrap();
             g[10][10] += d;
             g
         };
@@ -2436,7 +2422,7 @@ mod tests {
     #[test]
     fn anomaly_repair_raises_its_deviation_threshold_with_the_cell_size() {
         let spike = |d: f64| {
-            let mut g = vec![vec![100.0f64; 21]; 21];
+            let mut g = MmapGrid::from_rows(vec![vec![100.0f64; 21]; 21]).unwrap();
             g[10][10] += d;
             g
         };

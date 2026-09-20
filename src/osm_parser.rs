@@ -143,6 +143,99 @@ impl OsmData {
         // LLBBox::new rejects a zero-area (min == max) box; treat that as "no usable bounds".
         LLBBox::new(min_lat, min_lng, max_lat, max_lng).ok()
     }
+
+    /// Stable per-element identity: (OSM type, OSM id). Used by `merge`'s dedup and by
+    /// `retrieve_data`'s tiled-vs-single-query parity test, which needs to compare element
+    /// sets across a module boundary without exposing the private `OsmElement` type itself.
+    pub fn element_ids(&self) -> Vec<(String, u64)> {
+        self.elements
+            .iter()
+            .map(|e| (e.r#type.clone(), e.id))
+            .collect()
+    }
+
+    /// Merges Overpass responses fetched for adjacent sub-bboxes (see
+    /// `retrieve_data::fetch_data_from_overpass`'s large-area query-tiling path) into one
+    /// dataset. A way or relation whose bbox straddles a tile seam is returned in full,
+    /// unclipped, by every tile it overlaps — so the same (type, id) pair recurs verbatim
+    /// across parts and is deduplicated here, keeping the first copy seen. `remark` (if any)
+    /// is kept from the first part that had one; there is no single-query "whole area" remark
+    /// to preserve once the fetch has been split.
+    pub fn merge(parts: Vec<OsmData>) -> OsmData {
+        let mut seen: HashSet<(String, u64)> = HashSet::new();
+        let mut elements = Vec::new();
+        let mut remark = None;
+        for part in parts {
+            if remark.is_none() {
+                remark = part.remark;
+            }
+            for element in part.elements {
+                if seen.insert((element.r#type.clone(), element.id)) {
+                    elements.push(element);
+                }
+            }
+        }
+        OsmData { elements, remark }
+    }
+}
+
+#[cfg(test)]
+mod osm_data_merge_tests {
+    use super::*;
+
+    fn elem(kind: &str, id: u64) -> OsmElement {
+        OsmElement {
+            r#type: kind.into(),
+            id,
+            lat: Some(id as f64),
+            lon: Some(id as f64),
+            nodes: None,
+            tags: None,
+            members: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn merge_dedupes_by_type_and_id_keeping_first_copy() {
+        // Two adjacent query tiles both return way 7 in full (it straddles their seam),
+        // plus their own distinct elements.
+        let tile_a = OsmData {
+            elements: vec![elem("node", 1), elem("way", 7)],
+            remark: None,
+        };
+        let tile_b = OsmData {
+            elements: vec![elem("way", 7), elem("node", 2)],
+            remark: None,
+        };
+
+        let merged = OsmData::merge(vec![tile_a, tile_b]);
+
+        assert_eq!(merged.elements.len(), 3, "way 7 must appear exactly once");
+        let ids: Vec<(String, u64)> = merged
+            .elements
+            .iter()
+            .map(|e| (e.r#type.clone(), e.id))
+            .collect();
+        assert!(ids.contains(&("node".to_string(), 1)));
+        assert!(ids.contains(&("way".to_string(), 7)));
+        assert!(ids.contains(&("node".to_string(), 2)));
+    }
+
+    #[test]
+    fn merge_does_not_confuse_ids_across_element_types() {
+        // node/1 and way/1 share a numeric id but are distinct OSM elements.
+        let merged = OsmData::merge(vec![OsmData {
+            elements: vec![elem("node", 1), elem("way", 1)],
+            remark: None,
+        }]);
+        assert_eq!(merged.elements.len(), 2);
+    }
+
+    #[test]
+    fn merge_of_empty_parts_is_empty() {
+        assert!(OsmData::merge(vec![]).is_empty());
+        assert!(OsmData::merge(vec![OsmData::empty(), OsmData::empty()]).is_empty());
+    }
 }
 
 /// Parses a raw OSM XML (`.osm`) document into the same [`OsmData`] shape produced by the

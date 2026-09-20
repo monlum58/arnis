@@ -2,6 +2,7 @@ use crate::coordinate_system::geographic::LLBBox;
 use crate::elevation::cache::get_cache_dir;
 use crate::elevation::provider::{ElevationProvider, RawElevationGrid};
 use crate::elevation::providers::fixed_tile::MAX_TILES_PER_FETCH;
+use crate::elevation::MmapGrid;
 #[cfg(feature = "gui")]
 use crate::telemetry::{send_log, LogLevel};
 use rayon::prelude::*;
@@ -112,11 +113,15 @@ impl ElevationProvider for AwsTerrain {
 
         let n = 2.0_f64.powi(zoom as i32);
 
-        // Rows are independent; sample them in parallel
-        let height_grid: Vec<Vec<f64>> = (0..grid_height)
-            .into_par_iter()
-            .map(|gy| {
-                let mut row = vec![f64::NAN; grid_width];
+        // Rows are independent; sample them in parallel, straight into the
+        // mmap-backed grid rather than a temporary `Vec<Vec<f64>>`.
+        let mut height_grid = MmapGrid::<f64>::new(grid_height, grid_width)?;
+        height_grid
+            .as_flat_mut_slice()
+            .par_chunks_mut(grid_width)
+            .zip((0..grid_height).into_par_iter())
+            .for_each(|(row, gy)| {
+                row.fill(f64::NAN);
                 for (gx, cell) in row.iter_mut().enumerate() {
                     // Map grid cell to geographic coordinates
                     let lat = bbox.max().lat()
@@ -161,9 +166,7 @@ impl ElevationProvider for AwsTerrain {
                         *cell = lerp_top + (lerp_bot - lerp_top) * dy;
                     }
                 }
-                row
-            })
-            .collect();
+            });
 
         Ok(RawElevationGrid {
             heights_meters: height_grid,

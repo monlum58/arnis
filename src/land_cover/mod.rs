@@ -139,7 +139,15 @@ fn compute_water_blend_smooth(
     // 0.5 threshold, so precision beyond f32 is wasted. The mask is read on the
     // fly rather than materialized: on a city-sized grid the f64 copies were the
     // process memory peak.
-    crate::elevation::postprocess::gaussian_blur_mask_to_f32(grid, LC_WATER, width, height, sigma)
+    //
+    // `LandCoverData.water_blend_cache` is its own, smaller-scale `Vec<Vec<f32>>`
+    // field (separate from the elevation pipeline's mmap-backed grids this pass
+    // targets), so the mmap-backed blur result is converted back to owned rows
+    // once here at the boundary rather than changing that field's type.
+    let grid = crate::elevation::postprocess::gaussian_blur_mask_to_f32(
+        grid, LC_WATER, width, height, sigma,
+    );
+    grid.iter().map(|row| row.to_vec()).collect()
 }
 
 /// Metadata parsed from a COG (Cloud-Optimized GeoTIFF) IFD.

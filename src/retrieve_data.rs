@@ -213,15 +213,119 @@ pub fn fetch_data_from_file(
     }
 }
 
-/// Main function to fetch data
+/// Above this, a single Overpass query's bbox is split into a grid of sub-queries
+/// (see `fetch_data_from_overpass`) instead of risking truncation. `ARNIS_MAX_QUERY_AREA_KM2`
+/// overrides for testing/tuning. Kept comfortably under `main.rs`'s 250km² "large area" heads-up
+/// threshold: that number is a heavy-generation warning, this one is Overpass's own honesty limit.
+const DEFAULT_MAX_QUERY_AREA_KM2: f64 = 150.0;
+
+fn max_query_area_km2() -> f64 {
+    std::env::var("ARNIS_MAX_QUERY_AREA_KM2")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(DEFAULT_MAX_QUERY_AREA_KM2)
+}
+
+/// Main function to fetch data. Transparently splits a bbox larger than the safe single-query
+/// area into a grid of sub-queries (each run through the normal multi-server fallback path) and
+/// merges the results, so callers never need to know whether a fetch was tiled.
 pub fn fetch_data_from_overpass(
     bbox: LLBBox,
     debug: bool,
     download_method: &str,
     save_file: Option<&str>,
 ) -> Result<OsmData, Box<dyn std::error::Error>> {
-    println!("{} Fetching data...", "[1/7]".bold());
-    emit_gui_progress_update(1.0, "Downloading data...");
+    let tiles = bbox.split_into_grid(max_query_area_km2());
+
+    if tiles.len() <= 1 {
+        return fetch_single_bbox_from_overpass(bbox, debug, download_method, save_file, None);
+    }
+
+    // A per-tile save wouldn't be one coherent Overpass response, and OsmData has no
+    // Serialize impl to reconstitute a merged one — tell the user plainly rather than
+    // silently keeping only the last tile's raw body under their requested filename.
+    if save_file.is_some() {
+        eprintln!(
+            "{}",
+            "Warning: --save-json-file is not supported for large-area (tiled) fetches; \
+             ignoring it for this run."
+                .yellow()
+                .bold()
+        );
+    }
+
+    let total = tiles.len();
+    println!(
+        "{} Area (~{:.0} km²) exceeds the safe single-query size ({:.0} km²); \
+         fetching in {total} tiles...",
+        "[1/7]".bold(),
+        bbox.area_km2(),
+        max_query_area_km2(),
+    );
+    emit_gui_progress_update(1.0, "Downloading data (large area, tiled)...");
+
+    let mut parts = Vec::with_capacity(total);
+    for (i, tile) in tiles.into_iter().enumerate() {
+        let data =
+            fetch_single_bbox_from_overpass(tile, debug, download_method, None, Some((i + 1, total)))?;
+        parts.push(data);
+        // Fetch phase spans roughly 1.0-5.0 in the overall progress bar; PROGRESS_FLOOR
+        // makes this monotonic even if a later tile's exact fraction undershoots.
+        let pct = 1.0 + ((i + 1) as f64 / total as f64) * 4.0;
+        emit_gui_progress_update(pct, &format!("Downloaded tile {}/{total}", i + 1));
+    }
+
+    let merged = OsmData::merge(parts);
+    warn_if_empty(&merged, debug);
+    emit_gui_progress_update(5.0, "");
+    Ok(merged)
+}
+
+/// Emits the "nothing mapped here" warning used after a fetch completes. Split out so the
+/// tiled path checks the merged result once, not once per (possibly sparse) sub-tile.
+fn warn_if_empty(data: &OsmData, debug: bool) {
+    if !data.is_empty() {
+        return;
+    }
+    if let Some(remark) = data.remark.as_deref() {
+        eprintln!(
+            "{}",
+            format!("Warning: API returned: {remark}. Continuing without OSM data.")
+                .yellow()
+                .bold()
+        );
+    } else {
+        eprintln!(
+            "{}",
+            "Warning: OSM API returned no data for this area. Continuing with terrain/nature only."
+                .yellow()
+                .bold()
+        );
+    }
+    if debug {
+        println!("Additional debug information: {data:?}");
+    }
+}
+
+/// Fetches one Overpass query for a single (already safely-sized) bbox. `tile_label`, when
+/// set to `(index, total)`, is a 1-based tile counter used to make console output legible
+/// during a tiled fetch; `None` means "this is the whole fetch," matching the pre-tiling
+/// output exactly (ISC-8: the untiled path is byte-for-byte unchanged).
+fn fetch_single_bbox_from_overpass(
+    bbox: LLBBox,
+    debug: bool,
+    download_method: &str,
+    save_file: Option<&str>,
+    tile_label: Option<(usize, usize)>,
+) -> Result<OsmData, Box<dyn std::error::Error>> {
+    match tile_label {
+        None => println!("{} Fetching data...", "[1/7]".bold()),
+        Some((i, total)) => println!("{} Fetching data (tile {i}/{total})...", "[1/7]".bold()),
+    }
+    if tile_label.is_none() {
+        emit_gui_progress_update(1.0, "Downloading data...");
+    }
 
     // List of Overpass API servers
     let arnis_api_server = "https://api.arnismc.com/overpass/api/interpreter";
@@ -431,17 +535,27 @@ pub fn fetch_data_from_overpass(
             // Only blame the bbox when truncation is what every answering server did.
             // If some hosts simply never replied, the size is not the established cause.
             if truncated > 0 && truncated == answered {
+                let advice = if tile_label.is_some() {
+                    "Try using a smaller area, or lower ARNIS_MAX_QUERY_AREA_KM2 \
+                     so each tile requests less data."
+                } else {
+                    "Try using a smaller area."
+                };
                 eprintln!(
                     "{}",
-                    "Error! The area is too large for the OpenStreetMap API: the servers \
-                     that answered all stopped early. Try using a smaller area."
-                        .red()
-                        .bold()
+                    format!(
+                        "Error! The area is too large for the OpenStreetMap API: the servers \
+                         that answered all stopped early. {advice}"
+                    )
+                    .red()
+                    .bold()
                 );
-                emit_gui_error("Try using a smaller area.");
+                emit_gui_error(advice);
                 // Same exit as the out-of-memory case below: the CLI unwraps this
                 // Result, so returning Err here would replace the advice with a panic.
-                if !is_running_with_gui() {
+                // A tile within a larger tiled fetch propagates the error instead of
+                // exiting the whole process, so the wrapper's tile-count context survives.
+                if tile_label.is_none() && !is_running_with_gui() {
                     std::process::exit(1);
                 }
                 return Err("Data fetch failed".into());
@@ -465,7 +579,10 @@ pub fn fetch_data_from_overpass(
             println!("API response saved to: {save_file}");
         }
 
-        if data.is_empty() {
+        // Under tiling, a sparse individual tile legitimately having zero elements is
+        // normal (the emptiness that matters is the merged result); the wrapper checks
+        // that once via `warn_if_empty` instead of firing this per tile.
+        if data.is_empty() && tile_label.is_none() {
             // Every remark that means the server gave up was already rejected by
             // parse_overpass_response, which failed over to the next host. Reaching
             // here with no elements means the bbox genuinely has nothing mapped in
@@ -492,7 +609,9 @@ pub fn fetch_data_from_overpass(
             }
         }
 
-        emit_gui_progress_update(5.0, "");
+        if tile_label.is_none() {
+            emit_gui_progress_update(5.0, "");
+        }
 
         Ok(data)
     }
@@ -701,5 +820,112 @@ mod fetch_from_file_tests {
             fetch_data_from_file(path.to_str().unwrap()).expect("JSON dump should load");
         assert!(bounds.is_none());
         assert!(!data.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod large_area_tiling_tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    // Both tests in this module hit the same shared public Overpass mirrors. `cargo test`
+    // runs tests in parallel by default, so without this they fire concurrently and can
+    // trip a mirror's own per-IP rate limit purely from self-inflicted simultaneous load
+    // (seen live: api.arnismc.com replying "Rate limited. Try again later." mid-run).
+    // Holding this for the whole test body serializes them against each other.
+    static NETWORK_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    // Real network, real Overpass servers. Run manually:
+    // cargo test --release --no-default-features large_area -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn tiled_fetch_completes_for_a_bbox_above_the_safe_single_query_threshold() {
+        let _guard = NETWORK_TEST_LOCK.lock().unwrap();
+
+        // ~430km^2 around Shinjuku/Shibuya, well above the 150km^2 default threshold and
+        // dense enough that a single untiled query over this area is exactly the shape that
+        // used to hard-error with "area is too large for the OpenStreetMap API".
+        let bbox = LLBBox::new(35.62, 139.62, 35.72, 139.78).unwrap();
+        assert!(
+            bbox.split_into_grid(max_query_area_km2()).len() > 1,
+            "test bbox must actually exceed the tiling threshold"
+        );
+
+        let data = fetch_data_from_overpass(bbox, false, "requests", None)
+            .expect("tiled fetch of a real dense metro-scale area should not hard-error");
+        assert!(
+            !data.is_empty(),
+            "a real Tokyo-area bbox should return OSM elements"
+        );
+    }
+
+    // Real network. Proves ISC-9: tiling + id-merge reconstructs the same element set a
+    // single (non-truncated) query would have returned, for an area small enough to safely
+    // run both ways. Run manually:
+    // cargo test --release --no-default-features tiled_fetch_matches -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn tiled_fetch_matches_single_query_for_an_area_safe_under_both_paths() {
+        let _guard = NETWORK_TEST_LOCK.lock().unwrap();
+
+        // Small central-Tokyo area: safely fetchable in one untiled query, used here as the
+        // ground truth to compare the forced-tiled path against.
+        let bbox = LLBBox::new(35.65, 139.69, 35.665, 139.705).unwrap();
+
+        let single =
+            fetch_single_bbox_from_overpass(bbox, false, "requests", None, None).unwrap();
+
+        // Force tiling on this small area by dropping the threshold well below its real size.
+        let forced_tiles = bbox.split_into_grid(bbox.area_km2() / 4.0);
+        assert!(
+            forced_tiles.len() > 1,
+            "forced threshold must actually split this bbox"
+        );
+        let total = forced_tiles.len();
+        let mut parts = Vec::new();
+        for (i, tile) in forced_tiles.into_iter().enumerate() {
+            parts.push(
+                fetch_single_bbox_from_overpass(
+                    tile,
+                    false,
+                    "requests",
+                    None,
+                    Some((i + 1, total)),
+                )
+                .unwrap(),
+            );
+        }
+        let tiled = OsmData::merge(parts);
+
+        // Dedup by identity before comparing: Overpass legitimately re-emits an element once
+        // per relation it belongs to (see osm_parser.rs's own "keep the first copy only"
+        // handling), so a raw single-query response already contains internal (type, id)
+        // duplicates that have nothing to do with tiling. `OsmData::merge` already collapses
+        // these via its id-keyed `seen` set, so the single-query side must be collapsed the
+        // same way or every relation-member duplicate reads as a false tiling mismatch.
+        let single_ids: HashSet<(String, u64)> = single.element_ids().into_iter().collect();
+        let tiled_ids: HashSet<(String, u64)> = tiled.element_ids().into_iter().collect();
+
+        // Exact equality isn't achievable against live data: the single query and each tile
+        // query are independent HTTP requests that can land on different public Overpass
+        // mirror instances (arnis's own multi-server fallback, by design), and mirrors
+        // resync from the OSM planet diff stream on their own independent schedules. Verified
+        // live during this investigation: way 1559832411 was present on maps.mail.ru at
+        // timestamp_osm_base 2026-09-20T07:05:05Z but absent from the mirror(s) that answered
+        // this test's tile sub-queries moments later — a real edit-propagation-lag gap, not a
+        // merge/split defect. A small tolerance absorbs that inherent cross-mirror skew while
+        // still catching a real tiling regression (which would show up as a large mismatch).
+        let missing_from_tiled: Vec<_> = single_ids.difference(&tiled_ids).collect();
+        let extra_in_tiled: Vec<_> = tiled_ids.difference(&single_ids).collect();
+        let mismatch_count = missing_from_tiled.len() + extra_in_tiled.len();
+        let tolerance = (single_ids.len() / 200).max(5); // 0.5%, floor of 5 elements
+        assert!(
+            mismatch_count <= tolerance,
+            "tiled fetch must reconstruct essentially the same element set as a single query \
+             (within live-mirror staleness tolerance): {mismatch_count} mismatched elements \
+             (tolerance {tolerance}); missing from tiled: {missing_from_tiled:?}; \
+             extra in tiled: {extra_in_tiled:?}"
+        );
     }
 }

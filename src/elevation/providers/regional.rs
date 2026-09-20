@@ -1,6 +1,7 @@
 //! Shared HTTP and GeoTIFF helpers used by fixed_tile's downloader.
 
 use crate::elevation::provider::RawElevationGrid;
+use crate::elevation::MmapGrid;
 
 /// Maximum total attempts per request, including the initial one.
 ///
@@ -148,25 +149,25 @@ pub(super) fn decode_geotiff_f32(
 
     let height_grid = match result {
         tiff::decoder::DecodingResult::F32(data) => {
-            resample_nearest(&data, src_width, target_width, target_height, |v| v as f64)
+            resample_nearest(&data, src_width, target_width, target_height, |v| v as f64)?
         }
         tiff::decoder::DecodingResult::F64(data) => {
-            resample_nearest(&data, src_width, target_width, target_height, |v| v)
+            resample_nearest(&data, src_width, target_width, target_height, |v| v)?
         }
         tiff::decoder::DecodingResult::U8(data) => {
-            resample_nearest(&data, src_width, target_width, target_height, |v| v as f64)
+            resample_nearest(&data, src_width, target_width, target_height, |v| v as f64)?
         }
         tiff::decoder::DecodingResult::U16(data) => {
-            resample_nearest(&data, src_width, target_width, target_height, |v| v as f64)
+            resample_nearest(&data, src_width, target_width, target_height, |v| v as f64)?
         }
         tiff::decoder::DecodingResult::I16(data) => {
-            resample_nearest(&data, src_width, target_width, target_height, |v| v as f64)
+            resample_nearest(&data, src_width, target_width, target_height, |v| v as f64)?
         }
         tiff::decoder::DecodingResult::U32(data) => {
-            resample_nearest(&data, src_width, target_width, target_height, |v| v as f64)
+            resample_nearest(&data, src_width, target_width, target_height, |v| v as f64)?
         }
         tiff::decoder::DecodingResult::I32(data) => {
-            resample_nearest(&data, src_width, target_width, target_height, |v| v as f64)
+            resample_nearest(&data, src_width, target_width, target_height, |v| v as f64)?
         }
         _ => return Err("Unsupported TIFF pixel type".into()),
     };
@@ -193,17 +194,19 @@ fn resample_nearest<T: Copy>(
     target_width: usize,
     target_height: usize,
     cast: impl Fn(T) -> f64,
-) -> Vec<Vec<f64>> {
-    let mut height_grid: Vec<Vec<f64>> = vec![vec![f64::NAN; target_width]; target_height];
+) -> std::io::Result<MmapGrid<f64>> {
+    let mut height_grid = MmapGrid::<f64>::new(target_height, target_width)?;
     let src_height = src.len().checked_div(src_width).unwrap_or(0);
     let target_y_den = target_height.saturating_sub(1).max(1);
     let target_x_den = target_width.saturating_sub(1).max(1);
     let src_y_extent = src_height.saturating_sub(1);
     let src_x_extent = src_width.saturating_sub(1);
 
-    for (ty, row) in height_grid.iter_mut().enumerate().take(target_height) {
+    for ty in 0..target_height {
         let sy = (ty as f64 / target_y_den as f64 * src_y_extent as f64) as usize;
         let sy = sy.min(src_y_extent);
+        let row = &mut height_grid[ty];
+        row.fill(f64::NAN);
         for (tx, slot) in row.iter_mut().enumerate().take(target_width) {
             let sx = (tx as f64 / target_x_den as f64 * src_x_extent as f64) as usize;
             let sx = sx.min(src_x_extent);
@@ -219,5 +222,5 @@ fn resample_nearest<T: Copy>(
         }
     }
 
-    height_grid
+    Ok(height_grid)
 }

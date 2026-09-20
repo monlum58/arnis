@@ -7,6 +7,7 @@
 use crate::coordinate_system::geographic::LLBBox;
 use crate::elevation::cache::get_cache_dir;
 use crate::elevation::provider::{ElevationProvider, RawElevationGrid};
+use crate::elevation::MmapGrid;
 use crate::elevation::providers::fixed_tile::MAX_TILES_PER_FETCH;
 use fnv::{FnvHashMap, FnvHashSet};
 use rayon::prelude::*;
@@ -93,7 +94,7 @@ impl ElevationProvider for Mapterhorn {
             grid_height
         );
 
-        let height_grid = sample_grid(bbox, zoom, &outcome, &cache_dir, grid_width, grid_height);
+        let height_grid = sample_grid(bbox, zoom, &outcome, &cache_dir, grid_width, grid_height)?;
 
         Ok(RawElevationGrid {
             heights_meters: height_grid,
@@ -603,9 +604,9 @@ fn sample_grid(
     cache_dir: &Path,
     grid_width: usize,
     grid_height: usize,
-) -> Vec<Vec<f64>> {
+) -> std::io::Result<MmapGrid<f64>> {
     let floor = MIN_ZOOM.min(zoom);
-    let mut height_grid: Vec<Vec<f64>> = Vec::with_capacity(grid_height);
+    let mut height_grid = MmapGrid::<f64>::new(grid_height, grid_width)?;
     let mut unreadable: FnvHashSet<TileKey> = FnvHashSet::default();
 
     for chunk_start in (0..grid_height).step_by(SAMPLE_CHUNK_ROWS) {
@@ -622,12 +623,18 @@ fn sample_grid(
             &mut unreadable,
         );
 
-        let mut rows: Vec<Vec<f64>> = (chunk_start..chunk_end)
-            .into_par_iter()
-            .map(|gy| {
+        // Write straight into this chunk's slice of the mmap grid instead of
+        // collecting a temporary `Vec<Vec<f64>>` and appending it — one less
+        // full-chunk copy, and the destination is reclaimable page cache
+        // rather than permanent heap.
+        let chunk_slice =
+            &mut height_grid.as_flat_mut_slice()[chunk_start * grid_width..chunk_end * grid_width];
+        chunk_slice
+            .par_chunks_mut(grid_width)
+            .zip((chunk_start..chunk_end).into_par_iter())
+            .for_each(|(row, gy)| {
                 let lat = row_lat(bbox, gy, grid_height);
                 let norm_y = norm_y_for_lat(lat);
-                let mut row = vec![f64::NAN; grid_width];
                 for (gx, cell) in row.iter_mut().enumerate() {
                     let lng = bbox.min().lng()
                         + (gx as f64 / (grid_width - 1).max(1) as f64)
@@ -648,13 +655,10 @@ fn sample_grid(
                         }
                     };
                 }
-                row
-            })
-            .collect();
-        height_grid.append(&mut rows);
+            });
     }
 
-    height_grid
+    Ok(height_grid)
 }
 
 /// Decode the available tiles a row chunk can touch, across all pyramid levels.
@@ -939,7 +943,7 @@ mod tests {
         };
 
         // 2500 rows forces three sampling chunks.
-        let grid = sample_grid(&bbox, 8, &outcome, tmp.path(), 64, 2500);
+        let grid = sample_grid(&bbox, 8, &outcome, tmp.path(), 64, 2500).unwrap();
         assert_eq!(grid.len(), 2500);
         for row in &grid {
             for &v in row {
@@ -967,7 +971,7 @@ mod tests {
             failed_downloads: 0,
         };
 
-        let grid = sample_grid(&bbox, 6, &outcome, tmp.path(), 32, 2500);
+        let grid = sample_grid(&bbox, 6, &outcome, tmp.path(), 32, 2500).unwrap();
         assert!(
             (grid[0][0] - 300.0).abs() < 0.51,
             "north row got {}",
@@ -998,7 +1002,7 @@ mod tests {
             confirmed_missing,
             failed_downloads: 0,
         };
-        let grid = sample_grid(&bbox, 8, &ocean, tmp.path(), 8, 8);
+        let grid = sample_grid(&bbox, 8, &ocean, tmp.path(), 8, 8).unwrap();
         assert!(grid.iter().flatten().all(|v| *v == 0.0));
 
         let failed = FetchOutcome {
@@ -1006,7 +1010,7 @@ mod tests {
             confirmed_missing: FnvHashSet::default(),
             failed_downloads: 3,
         };
-        let grid = sample_grid(&bbox, 8, &failed, tmp.path(), 8, 8);
+        let grid = sample_grid(&bbox, 8, &failed, tmp.path(), 8, 8).unwrap();
         assert!(grid.iter().flatten().all(|v| v.is_nan()));
     }
 

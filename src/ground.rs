@@ -5,7 +5,7 @@ use crate::coordinate_system::{
     cartesian::{XZBBox, XZPoint},
     geographic::LLBBox,
 };
-use crate::elevation::compute_grid_dims;
+use crate::elevation::{compute_grid_dims, MmapGrid};
 use crate::elevation_data::{fetch_elevation_data, ElevationData};
 use crate::land_cover::{self, LandCoverData};
 use crate::osm_parser::ProcessedElement;
@@ -192,7 +192,7 @@ impl Ground {
             extended_ceiling: false,
             ground_level: 0,
             elevation_data: Some(crate::elevation::ElevationData {
-                heights,
+                heights: MmapGrid::from_rows(heights).expect("elevation grid: mmap alloc"),
                 width: grid_width,
                 height: grid_height,
                 world_width,
@@ -789,11 +789,15 @@ impl Ground {
     ) {
         if let Some(ref mut data) = self.elevation_data {
             // Rotation operators build a fresh f64 work grid; downcast here to
-            // match `ElevationData::heights`'s f32 storage layout.
-            data.heights = heights
-                .into_iter()
-                .map(|row| row.into_iter().map(|v| v as f32).collect())
-                .collect();
+            // match `ElevationData::heights`'s f32 mmap-grid storage.
+            let mut grid =
+                MmapGrid::new(grid_height, grid_width).expect("elevation grid: mmap alloc");
+            for (y, row) in heights.into_iter().enumerate() {
+                for (x, v) in row.into_iter().enumerate() {
+                    grid[y][x] = v as f32;
+                }
+            }
+            data.heights = grid;
             data.width = grid_width;
             data.height = grid_height;
             data.world_width = world_width;
@@ -1114,7 +1118,7 @@ mod tests {
             extended_ceiling: false,
             ground_level: 0,
             elevation_data: Some(ElevationData {
-                heights,
+                heights: MmapGrid::from_rows(heights).expect("elevation grid: mmap alloc"),
                 width: w,
                 height: h,
                 world_width: w,
@@ -1227,7 +1231,7 @@ mod tests {
     #[test]
     fn snow_threshold_inverts_the_scale() {
         let ed = |min_m: f64, bpm: f64| ElevationData {
-            heights: vec![vec![0.0; 2]; 2],
+            heights: MmapGrid::new(2, 2).expect("elevation grid: mmap alloc"),
             width: 2,
             height: 2,
             world_width: 2,
@@ -1375,7 +1379,7 @@ pub(crate) mod test_support {
             extended_ceiling: false,
             ground_level: 0,
             elevation_data: Some(ElevationData {
-                heights: vec![vec![0.0f32; gw]; gh],
+                heights: MmapGrid::new(gh, gw).expect("elevation grid: mmap alloc"),
                 width: gw,
                 height: gh,
                 world_width,
