@@ -40,7 +40,7 @@ This fork backs those elevation buffers with a disk-mapped grid instead of plain
 
 **What changed, concretely:**
 - A bounding box of order 1,000+ km² (a whole metro area) now generates successfully instead of running out of memory or hitting an "area is too large" error.
-- Verified on a real ~2,000 km² area (central Tokyo through most of the 23 wards): completed in about 25 minutes using ~20GB RAM on a 32GB machine.
+- Verified on a real ~2,000 km² area (central Tokyo through most of the 23 wards): completed in 40 minutes (22 of them downloading), ~20GB RAM plus swap on a 32GB machine — see [`DEVELOPMENT_NOTES.md`](DEVELOPMENT_NOTES.md) for the honest caveat on how close to the ceiling that is and why an even larger area isn't guaranteed to succeed without more memory.
 - No change to how any generated world looks — every change was checked block-for-block against the unmodified output for the same area (see `examples/world_block_diff.rs`).
 - Added a `--name` CLI flag to name a generated Java Edition world, matching the option the GUI already had.
 
