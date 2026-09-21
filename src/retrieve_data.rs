@@ -11,7 +11,7 @@ use reqwest::blocking::ClientBuilder;
 use serde::Deserialize;
 use serde_json::Value;
 use std::fs::File;
-use std::io::{self, BufReader, Cursor, Write};
+use std::io::{self, BufReader, BufWriter, Cursor, Write};
 use std::process::Command;
 use std::time::Duration;
 
@@ -242,19 +242,6 @@ pub fn fetch_data_from_overpass(
         return fetch_single_bbox_from_overpass(bbox, debug, download_method, save_file, None);
     }
 
-    // A per-tile save wouldn't be one coherent Overpass response, and OsmData has no
-    // Serialize impl to reconstitute a merged one — tell the user plainly rather than
-    // silently keeping only the last tile's raw body under their requested filename.
-    if save_file.is_some() {
-        eprintln!(
-            "{}",
-            "Warning: --save-json-file is not supported for large-area (tiled) fetches; \
-             ignoring it for this run."
-                .yellow()
-                .bold()
-        );
-    }
-
     let total = tiles.len();
     println!(
         "{} Area (~{:.0} km²) exceeds the safe single-query size ({:.0} km²); \
@@ -278,6 +265,11 @@ pub fn fetch_data_from_overpass(
 
     let merged = OsmData::merge(parts);
     warn_if_empty(&merged, debug);
+    if let Some(save_file) = save_file {
+        let file = File::create(save_file)?;
+        serde_json::to_writer(BufWriter::new(file), &merged)?;
+        println!("Merged OSM data ({total} tiles) saved to: {save_file}");
+    }
     emit_gui_progress_update(5.0, "");
     Ok(merged)
 }
@@ -820,6 +812,46 @@ mod fetch_from_file_tests {
             fetch_data_from_file(path.to_str().unwrap()).expect("JSON dump should load");
         assert!(bounds.is_none());
         assert!(!data.is_empty());
+    }
+
+    // A tiled fetch's merged OsmData must round-trip through save/reload exactly like a
+    // single-bbox fetch's raw response already does — this is what makes --save-json-file
+    // usable above the tiling threshold (previously refused outright: OsmData had no
+    // Serialize impl, so there was nothing coherent to write for a merged, multi-tile result).
+    #[test]
+    fn merged_tiled_data_round_trips_through_save_and_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let tile_a_path = dir.path().join("tile_a.json");
+        let tile_b_path = dir.path().join("tile_b.json");
+        std::fs::write(
+            &tile_a_path,
+            r#"{"elements":[{"type":"node","id":1,"lat":1.0,"lon":2.0},{"type":"way","id":7,"lat":null,"lon":null,"nodes":[1,2]}],"remark":null}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &tile_b_path,
+            // Way 7 straddles the seam and is re-sent in full by the adjacent tile, exactly
+            // as real Overpass tiling behaves; merge() must dedupe it.
+            r#"{"elements":[{"type":"way","id":7,"lat":null,"lon":null,"nodes":[1,2]},{"type":"node","id":2,"lat":1.1,"lon":2.1}],"remark":null}"#,
+        )
+        .unwrap();
+
+        let (tile_a, _) = fetch_data_from_file(tile_a_path.to_str().unwrap()).unwrap();
+        let (tile_b, _) = fetch_data_from_file(tile_b_path.to_str().unwrap()).unwrap();
+        let merged = OsmData::merge(vec![tile_a, tile_b]);
+        assert_eq!(merged.element_ids().len(), 3, "way 7 deduped across tiles");
+
+        let save_path = dir.path().join("merged.json");
+        let file = File::create(&save_path).unwrap();
+        serde_json::to_writer(BufWriter::new(file), &merged).unwrap();
+
+        let (reloaded, bounds) = fetch_data_from_file(save_path.to_str().unwrap()).unwrap();
+        assert!(bounds.is_none(), "JSON dump path carries no <bounds>, same as today");
+        let mut merged_ids = merged.element_ids();
+        let mut reloaded_ids = reloaded.element_ids();
+        merged_ids.sort();
+        reloaded_ids.sort();
+        assert_eq!(reloaded_ids, merged_ids, "reload must be byte-for-byte the same elements");
     }
 }
 

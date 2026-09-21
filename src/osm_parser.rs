@@ -4,7 +4,7 @@ use crate::coordinate_system::geographic::{LLBBox, LLPoint};
 use crate::coordinate_system::transformation::CoordTransformer;
 use crate::progress::emit_gui_progress_update;
 use colored::Colorize;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -79,14 +79,14 @@ fn filter_tags(mut tags: HashMap<String, String>) -> HashMap<String, String> {
 
 // Raw data from OSM
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct OsmMember {
     r#type: String,
     r#ref: u64,
     r#role: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct OsmElement {
     pub r#type: String,
     pub id: u64,
@@ -98,7 +98,11 @@ struct OsmElement {
     pub members: Vec<OsmMember>,
 }
 
-#[derive(Debug, Deserialize)]
+/// Same shape Overpass itself returns (`{"elements": [...], "remark": ...}`), so this doubles
+/// as Arnis's own dump format: a single-bbox fetch's raw response body already round-trips
+/// through `fetch_data_from_file`, and `Serialize` here lets a *merged* (tiled) result be
+/// written out too, for `retrieve_data::fetch_data_from_overpass`'s `save_file` support.
+#[derive(Debug, Deserialize, Serialize)]
 pub struct OsmData {
     elements: Vec<OsmElement>,
     #[serde(default)]
