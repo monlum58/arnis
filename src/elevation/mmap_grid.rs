@@ -21,11 +21,13 @@ use std::mem::size_of;
 use std::ops::{Index, IndexMut};
 
 /// The plain-old-data numeric types `MmapGrid` supports. Sealed to `f32`/
-/// `f64` — the two real element types the elevation pipeline uses — rather
-/// than a general-purpose `bytemuck`-style abstraction nothing else needs.
+/// `f64`/`u8` — the real element types the elevation and land-cover/canopy
+/// pipelines use — rather than a general-purpose `bytemuck`-style
+/// abstraction nothing else needs.
 pub trait GridElement: Copy + Default + Send + Sync + 'static {}
 impl GridElement for f32 {}
 impl GridElement for f64 {}
+impl GridElement for u8 {}
 
 /// Directory the backing temp files are created in. Deliberately **not**
 /// `tempfile::tempfile()`'s default (`std::env::temp_dir()`, i.e. `/tmp` on
@@ -80,6 +82,15 @@ impl<T: GridElement> MmapGrid<T> {
             cols,
             _marker: PhantomData,
         })
+    }
+
+    /// A `rows x cols` grid pre-filled with `value` — for element types
+    /// (e.g. `u8` sentinels like a canopy "no data" marker) whose meaningful
+    /// empty state is not the all-zero bit pattern `new` gives for free.
+    pub fn filled(rows: usize, cols: usize, value: T) -> io::Result<Self> {
+        let mut grid = Self::new(rows, cols)?;
+        grid.as_flat_mut_slice().fill(value);
+        Ok(grid)
     }
 
     /// Builds a grid from row data, consuming it. Rows narrower than the
@@ -308,6 +319,14 @@ mod tests {
             for x in 0..5 {
                 assert_eq!(grid[y][x], (y * 5 + x) as f32 * 1.5);
             }
+        }
+    }
+
+    #[test]
+    fn filled_grid_starts_at_the_given_value_everywhere() {
+        let grid = MmapGrid::<u8>::filled(3, 4, 255).unwrap();
+        for row in grid.iter() {
+            assert_eq!(row, &[255u8; 4]);
         }
     }
 

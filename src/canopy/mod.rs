@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use rayon::prelude::*;
 
 use crate::coordinate_system::geographic::LLBBox;
+use crate::elevation::mmap_grid::MmapGrid;
 
 const TILE_ZOOM: u32 = 9;
 const TILE_PX: u64 = 65536;
@@ -41,16 +42,33 @@ const SLOT_P_MAX: f64 = 0.85;
 
 /// Canopy heights on the same grid as the land cover, so one set of ratios
 /// addresses both.
-#[derive(Clone)]
 pub struct CanopyData {
     /// Row-major, `width * height`, metres, `CANOPY_NODATA` where unmeasured.
-    grid: Vec<u8>,
+    /// Disk-backed (see `elevation::mmap_grid`): at metro scale this grid is
+    /// the same shape and order of magnitude as the land-cover grid it shares
+    /// resolution with, so it gets the same treatment rather than sitting
+    /// resident as a plain `Vec` for the whole run.
+    grid: MmapGrid<u8>,
     pub width: usize,
     pub height: usize,
 }
 
+impl Clone for CanopyData {
+    fn clone(&self) -> Self {
+        CanopyData {
+            grid: self.grid.clone(),
+            width: self.width,
+            height: self.height,
+        }
+    }
+}
+
 impl CanopyData {
-    pub fn from_grid(grid: Vec<u8>, width: usize, height: usize) -> Self {
+    /// Takes ownership of an already disk-backed grid with no extra copy —
+    /// used by `fetch_canopy_data`, the one real-scale producer, which fills
+    /// the mmap's flat slice directly rather than ever holding a plain `Vec`
+    /// the size of the whole grid.
+    pub fn from_mmap_grid(grid: MmapGrid<u8>, width: usize, height: usize) -> Self {
         CanopyData {
             grid,
             width,
@@ -58,12 +76,23 @@ impl CanopyData {
         }
     }
 
+    /// Boundary conversion for the smaller producers (grid rotation, tests):
+    /// copies a flat `width * height` row-major `Vec` into a fresh mmap grid,
+    /// the same "accept a plain buffer, copy in once" shape `MmapGrid::from_rows`
+    /// already uses for the elevation pipeline's own boundary conversions.
+    pub fn from_grid(grid: Vec<u8>, width: usize, height: usize) -> Self {
+        let mut mmap_grid =
+            MmapGrid::<u8>::filled(height, width, CANOPY_NODATA).expect("CanopyData: mmap alloc");
+        mmap_grid.as_flat_mut_slice().copy_from_slice(&grid);
+        Self::from_mmap_grid(mmap_grid, width, height)
+    }
+
     #[inline(always)]
     pub fn at(&self, gx: usize, gz: usize) -> u8 {
         if gx >= self.width || gz >= self.height {
             return CANOPY_NODATA;
         }
-        self.grid[gz * self.width + gx]
+        self.grid.as_flat_slice()[gz * self.width + gx]
     }
 
     /// Covered cells, canopy cells, mean height, tallest. For the log line.
@@ -72,7 +101,7 @@ impl CanopyData {
         let mut canopy = 0usize;
         let mut sum = 0u64;
         let mut max = 0u8;
-        for &h in &self.grid {
+        for &h in self.grid.as_flat_slice() {
             if h == CANOPY_NODATA {
                 continue;
             }
@@ -495,21 +524,33 @@ pub fn fetch_canopy_data(
 
     // Nearest-neighbour, not averaging: at 0.8 m the source is finer than the
     // block grid and averaging would smear a crown into the lawn.
-    let mut grid = vec![CANOPY_NODATA; grid_width * grid_height];
+    // Disk-backed from the start (see `elevation::mmap_grid`): at metro scale
+    // this grid is real memory for the whole fetch, not just after it, so the
+    // full-size `Vec` this used to build up in RAM never exists at all.
+    let mut grid = MmapGrid::<u8>::filled(grid_height, grid_width, CANOPY_NODATA)
+        .expect("canopy grid: mmap alloc");
     let (x0, y0) = tile_xy(bbox.max().lat(), bbox.min().lng());
     let (x1, y1) = tile_xy(bbox.min().lat(), bbox.max().lng());
     let mut tiles = 0usize;
     let mut failures: Vec<String> = Vec::new();
     for yt in y0.min(y1)..=y0.max(y1) {
         for xt in x0.min(x1)..=x0.max(x1) {
-            match fill_from_tile(&client, xt, yt, bbox, grid_width, grid_height, &mut grid) {
+            match fill_from_tile(
+                &client,
+                xt,
+                yt,
+                bbox,
+                grid_width,
+                grid_height,
+                grid.as_flat_mut_slice(),
+            ) {
                 Ok(_) => tiles += 1,
                 Err(e) => failures.push(format!("{}: {}", quadkey_of(xt, yt), e)),
             }
         }
     }
 
-    let data = CanopyData::from_grid(grid, grid_width, grid_height);
+    let data = CanopyData::from_mmap_grid(grid, grid_width, grid_height);
     let (covered, canopy, mean, max) = data.stats();
     if covered == 0 {
         let why = failures
