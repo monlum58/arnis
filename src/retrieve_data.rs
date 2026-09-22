@@ -330,6 +330,12 @@ fn fetch_single_bbox_from_overpass(
         "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
         "https://overpass.private.coffee/api/interpreter",
     ];
+    // Optional personal/private Overpass server, tried before everything else when set.
+    // Deliberately an env var rather than a literal in this list: a private server's
+    // address is the operator's own infrastructure, not something that belongs baked
+    // into a public repo's source or git history. Unset (the default for everyone else
+    // running this fork) means zero behavior change from today.
+    let private_api_server: Option<String> = std::env::var("ARNIS_PRIVATE_OVERPASS_URL").ok();
 
     // Generate Overpass API query for bounding box.
     // Ocean/coastal elements are excluded because ESA WorldCover satellite data
@@ -386,6 +392,7 @@ fn fetch_single_bbox_from_overpass(
     {
         // Fetch data from Overpass API.
         // Strategy:
+        // 0) If ARNIS_PRIVATE_OVERPASS_URL is set, try it first, always.
         // 1) 50% chance: probe one random official server first.
         // 2) If the probe does not succeed, run the normal path: arnis API once,
         //    then shuffled official, then shuffled fallback servers.
@@ -398,6 +405,10 @@ fn fetch_single_bbox_from_overpass(
         let mut rng = rand::rng();
         let mut request_plan: Vec<(&str, ServerKind)> = Vec::new();
         let mut probed_server: Option<&str> = None;
+
+        if let Some(url) = private_api_server.as_deref() {
+            request_plan.push((url, ServerKind::Primary));
+        }
 
         if rng.random_bool(0.5) {
             let probe_idx = rng.random_range(0..api_servers.len());
