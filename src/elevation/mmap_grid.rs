@@ -45,12 +45,25 @@ fn backing_dir() -> io::Result<std::path::PathBuf> {
     Ok(dir)
 }
 
+/// Environment variable that switches grids to anonymous memory (RAM, swapped
+/// only under pressure). Chunked generation sets it for its child processes:
+/// a chunk's grids are bounded by the chunk size, and file-backed grids there
+/// cost far more than they save, since the kernel keeps writing their dirty
+/// pages back to disk (measured ~300 MB/s with 4-6 chunks in parallel).
+pub const ANON_GRIDS_ENV: &str = "ARNIS_ANON_GRIDS";
+
+fn anonymous_grids() -> bool {
+    static ANON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ANON.get_or_init(|| std::env::var_os(ANON_GRIDS_ENV).is_some_and(|v| v == "1"))
+}
+
 pub struct MmapGrid<T: GridElement> {
     mmap: MmapMut,
     // Kept alive alongside `mmap` for clarity; `tempfile::Builder::tempfile_in`
     // already unlinks the directory entry on Unix / marks delete-on-close on
-    // Windows, so no manual cleanup is needed on drop.
-    _file: File,
+    // Windows, so no manual cleanup is needed on drop. `None` for an
+    // anonymous mapping (see `anonymous_grids`).
+    _file: Option<File>,
     rows: usize,
     cols: usize,
     _marker: PhantomData<T>,
@@ -69,12 +82,17 @@ impl<T: GridElement> MmapGrid<T> {
         // to map a zero-length file. One byte is enough since no index into
         // rows=0 or cols=0 space is ever valid.
         let byte_len = (cell_count * elem_size).max(1) as u64;
-        let file = tempfile::Builder::new().tempfile_in(backing_dir()?)?.into_file();
-        file.set_len(byte_len)?;
-        // SAFETY: `file` is a fresh temp file created and exclusively held by
-        // this process; nothing else can be concurrently mutating it out from
-        // under the mapping (the usual mmap-of-a-shared-file hazard).
-        let mmap = unsafe { MmapMut::map_mut(&file)? };
+        let (mmap, file) = if anonymous_grids() {
+            (MmapMut::map_anon(byte_len as usize)?, None)
+        } else {
+            let file = tempfile::Builder::new().tempfile_in(backing_dir()?)?.into_file();
+            file.set_len(byte_len)?;
+            // SAFETY: `file` is a fresh temp file created and exclusively held by
+            // this process; nothing else can be concurrently mutating it out from
+            // under the mapping (the usual mmap-of-a-shared-file hazard).
+            let mmap = unsafe { MmapMut::map_mut(&file)? };
+            (mmap, Some(file))
+        };
         Ok(Self {
             mmap,
             _file: file,

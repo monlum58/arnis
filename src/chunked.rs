@@ -15,6 +15,7 @@
 
 use crate::args::Args;
 use crate::coordinate_system::transformation::CoordTransformer;
+use crate::elevation::mmap_grid::ANON_GRIDS_ENV;
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -359,6 +360,7 @@ pub fn run(args: &Args) -> ! {
                     let label = format!("terrain probe for chunk {}", plan.index + 1);
                     let result = try_with_retries(&label, || {
                         let output = Command::new(exe)
+                            .env(ANON_GRIDS_ENV, "1")
                             .args(passthrough)
                             .arg(format!("--bbox={}", bbox_arg(reference, plan)))
                             .arg(format!("--reference-bbox={ref_arg}"))
@@ -436,6 +438,7 @@ pub fn run(args: &Args) -> ! {
             }
             fs::create_dir_all(&chunk_out).map_err(|e| format!("create chunk dir: {e}"))?;
             let mut cmd = Command::new(&exe);
+            cmd.env(ANON_GRIDS_ENV, "1");
             cmd.args(&passthrough)
                 .arg(format!("--bbox={}", bbox_arg(&reference, plan)))
                 .arg(format!("--reference-bbox={ref_arg}"))
