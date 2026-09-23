@@ -41,6 +41,21 @@ impl CoordTransformer {
         self.scale_factor_z
     }
 
+    /// Local-mode position of `llpoint`, before truncation.
+    fn reference_f64(&self, llpoint: LLPoint) -> (f64, f64) {
+        let rel_x = (llpoint.lng() - self.min_lng) / self.len_lng;
+        let rel_z = 1.0 - (llpoint.lat() - self.min_lat) / self.len_lat;
+        (rel_x * self.scale_factor_x, rel_z * self.scale_factor_z)
+    }
+
+    /// Inverse of the Local mode for a reference-frame block position. Used to
+    /// pick chunk bboxes whose origins land exactly on chosen block coordinates.
+    pub fn reference_to_latlng(&self, x: f64, z: f64) -> (f64, f64) {
+        let lng = self.min_lng + x / self.scale_factor_x * self.len_lng;
+        let lat = self.min_lat + (1.0 - z / self.scale_factor_z) * self.len_lat;
+        (lat, lng)
+    }
+
     pub fn llbbox_to_xzbbox(
         llbbox: &LLBBox,
         scale: f64,
@@ -72,16 +87,17 @@ impl CoordTransformer {
         ))
     }
 
-    /// Like `llbbox_to_xzbbox`, but the transform's origin and scale come from
-    /// `reference_bbox` while the returned `XZBBox` covers only `processing_bbox`
-    /// — the sub-area actually being fetched/generated. Because the "Local" mode's
-    /// per-point formula (`transform_point`) depends on nothing but the four
-    /// numbers this derives from `reference_bbox` (origin, spans, scale factors),
-    /// two calls sharing the same `reference_bbox` produce coordinates for the
-    /// same real-world point that agree exactly — the basis for generating one
-    /// large area as several smaller, independently-run, memory-bounded chunks
-    /// that still tile together into one coherent world. `reference_bbox` ==
-    /// `processing_bbox` (i.e. plain `llbbox_to_xzbbox`) is the single-run case.
+    /// Like `llbbox_to_xzbbox`, but coordinates are those of a run over
+    /// `reference_bbox`, while the returned `XZBBox` covers only
+    /// `processing_bbox`, the sub-area actually fetched and generated.
+    ///
+    /// Every point lands exactly where a single run over the whole reference
+    /// area would put it, so separately generated chunks already sit in place
+    /// and their region files can simply be combined. The box's origin is where
+    /// the processing area starts in that frame; arnis already indexes terrain
+    /// and land cover relative to the box's minimum, not to 0.
+    ///
+    /// With `reference_bbox == processing_bbox` this is `llbbox_to_xzbbox`.
     pub fn llbbox_to_xzbbox_with_reference(
         reference_bbox: &LLBBox,
         processing_bbox: &LLBBox,
@@ -89,28 +105,16 @@ impl CoordTransformer {
     ) -> Result<(CoordTransformer, XZBBox), String> {
         let (transformer, _) = Self::llbbox_to_xzbbox(reference_bbox, scale)?;
 
-        let corners = [
-            LLPoint::new(processing_bbox.min().lat(), processing_bbox.min().lng()),
-            LLPoint::new(processing_bbox.min().lat(), processing_bbox.max().lng()),
-            LLPoint::new(processing_bbox.max().lat(), processing_bbox.min().lng()),
-            LLPoint::new(processing_bbox.max().lat(), processing_bbox.max().lng()),
-        ];
-        let mut x_min = i32::MAX;
-        let mut x_max = i32::MIN;
-        let mut z_min = i32::MAX;
-        let mut z_max = i32::MIN;
-        for corner in corners {
-            let Ok(corner) = corner else {
-                return Err("llbbox_to_xzbbox_with_reference: invalid processing_bbox corner".to_string());
-            };
-            let p = transformer.transform_point(corner);
-            x_min = x_min.min(p.x);
-            x_max = x_max.max(p.x);
-            z_min = z_min.min(p.z);
-            z_max = z_max.max(p.z);
-        }
-
-        let xzbbox = XZBBox::rect_from_min_max(x_min, z_min, x_max, z_max)
+        let nw = LLPoint::new(processing_bbox.max().lat(), processing_bbox.min().lng())?;
+        let se = LLPoint::new(processing_bbox.min().lat(), processing_bbox.max().lng())?;
+        let (x0, z0) = transformer.reference_f64(nw);
+        let (x1, z1) = transformer.reference_f64(se);
+        // Rounded, not truncated: chunk corners are chosen to sit exactly on a
+        // block boundary, and float error must not push that one block off.
+        let (min_x, min_z) = (x0.round() as i32, z0.round() as i32);
+        let max_x = (x1 as i32).max(min_x);
+        let max_z = (z1 as i32).max(min_z);
+        let xzbbox = XZBBox::rect_from_min_max(min_x, min_z, max_x, max_z)
             .map_err(|e| format!("Failed to create XZBBox from reference transform: {e}"))?;
 
         Ok((transformer, xzbbox))
@@ -274,66 +278,86 @@ mod chunking_tests {
     use super::*;
     use crate::test_utilities::get_llbbox_arnis;
 
-    // The premise a chunked large-area generation would rely on: two chunks that
-    // share the same reference_bbox must agree, exactly, on where any given
-    // real-world point lands - otherwise their separately-generated worlds would
-    // not tile together. `transform_point` depends only on the transformer's
-    // reference-derived fields, never on which chunk built it, so this should
-    // hold for every point, not just ones on the shared seam.
+    /// A chunk bbox whose north-west corner sits exactly on reference block
+    /// (x0, z0), running to (x1, z1).
+    fn chunk_at(reference: &CoordTransformer, x0: f64, z0: f64, x1: f64, z1: f64) -> LLBBox {
+        let (max_lat, min_lng) = reference.reference_to_latlng(x0, z0);
+        let (min_lat, max_lng) = reference.reference_to_latlng(x1, z1);
+        LLBBox::new(min_lat, min_lng, max_lat, max_lng).unwrap()
+    }
+
+    // A single run is the reference == processing case, and must not change at all.
     #[test]
-    fn transformers_sharing_a_reference_bbox_agree_on_every_point() {
-        let reference = get_llbbox_arnis();
-        let mid_lng = (reference.min().lng() + reference.max().lng()) / 2.0;
-
-        let chunk_a = LLBBox::new(
-            reference.min().lat(),
-            reference.min().lng(),
-            reference.max().lat(),
-            mid_lng,
-        )
-        .unwrap();
-        let chunk_b = LLBBox::new(
-            reference.min().lat(),
-            mid_lng,
-            reference.max().lat(),
-            reference.max().lng(),
-        )
-        .unwrap();
-
-        let (transformer_a, xzbbox_a) =
-            CoordTransformer::llbbox_to_xzbbox_with_reference(&reference, &chunk_a, 1.0).unwrap();
-        let (transformer_b, xzbbox_b) =
-            CoordTransformer::llbbox_to_xzbbox_with_reference(&reference, &chunk_b, 1.0).unwrap();
-
-        // A handful of real-world points, including ones on the shared seam and ones
-        // each chunk would never itself fetch data for (outside its own bbox) - the
-        // point of a shared reference is that the *mapping* doesn't care.
-        let probe_points = [
-            LLPoint::new(reference.min().lat(), mid_lng).unwrap(),
-            LLPoint::new(reference.max().lat(), mid_lng).unwrap(),
-            LLPoint::new(
-                (reference.min().lat() + reference.max().lat()) / 2.0,
-                mid_lng,
-            )
-            .unwrap(),
-            LLPoint::new(reference.min().lat(), reference.min().lng()).unwrap(),
-            LLPoint::new(reference.max().lat(), reference.max().lng()).unwrap(),
-        ];
-        for point in probe_points {
-            assert_eq!(
-                transformer_a.transform_point(point),
-                transformer_b.transform_point(point),
-                "chunk A and chunk B transformers disagree on {point:?} despite sharing a reference_bbox"
-            );
-        }
-
-        // The two chunks' own extents must tile without a gap or overlap: chunk A's
-        // east edge is chunk B's west edge, in the shared coordinate space.
+    fn reference_equal_to_processing_is_the_plain_transform() {
+        let bbox = get_llbbox_arnis();
+        let (plain, plain_box) = CoordTransformer::llbbox_to_xzbbox(&bbox, 1.0).unwrap();
+        let (with_ref, ref_box) =
+            CoordTransformer::llbbox_to_xzbbox_with_reference(&bbox, &bbox, 1.0).unwrap();
         assert_eq!(
-            xzbbox_a.max_x(),
-            xzbbox_b.min_x(),
-            "chunk A's east edge must exactly meet chunk B's west edge"
+            (
+                plain_box.min_x(),
+                plain_box.min_z(),
+                plain_box.max_x(),
+                plain_box.max_z()
+            ),
+            (
+                ref_box.min_x(),
+                ref_box.min_z(),
+                ref_box.max_x(),
+                ref_box.max_z()
+            )
         );
+        for i in 0..=20 {
+            for j in 0..=20 {
+                let p = LLPoint::new(
+                    bbox.min().lat() + (bbox.max().lat() - bbox.min().lat()) * i as f64 / 20.0,
+                    bbox.min().lng() + (bbox.max().lng() - bbox.min().lng()) * j as f64 / 20.0,
+                )
+                .unwrap();
+                assert_eq!(plain.transform_point(p), with_ref.transform_point(p));
+            }
+        }
+    }
+
+    // What chunked generation relies on: a chunk puts every point, bit for bit,
+    // where a single run over the whole reference area would, inside the chunk
+    // or not, and its box starts exactly on the block it was cut at. Otherwise
+    // separately generated chunks would not line up in one world.
+    #[test]
+    fn chunk_coordinates_match_a_single_run_over_the_reference_area() {
+        let bbox = get_llbbox_arnis();
+        let (whole, _) = CoordTransformer::llbbox_to_xzbbox(&bbox, 1.0).unwrap();
+
+        let chunks = [
+            chunk_at(&whole, 0.0, 0.0, 256.0, 512.0),
+            chunk_at(&whole, 256.0, 128.0, 600.0, 800.0),
+        ];
+        let expected_offsets = [(0, 0), (256, 128)];
+
+        for (chunk, expected_offset) in chunks.iter().zip(expected_offsets) {
+            let (local, local_box) =
+                CoordTransformer::llbbox_to_xzbbox_with_reference(&bbox, chunk, 1.0).unwrap();
+            assert_eq!(
+                (local_box.min_x(), local_box.min_z()),
+                expected_offset,
+                "chunk box must start on the block it was cut at"
+            );
+
+            for i in 0..=40 {
+                for j in 0..=40 {
+                    let p = LLPoint::new(
+                        bbox.min().lat() + (bbox.max().lat() - bbox.min().lat()) * i as f64 / 40.0,
+                        bbox.min().lng() + (bbox.max().lng() - bbox.min().lng()) * j as f64 / 40.0,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        local.transform_point(p),
+                        whole.transform_point(p),
+                        "chunk at {expected_offset:?} disagrees with the single run on {p:?}"
+                    );
+                }
+            }
+        }
     }
 }
 

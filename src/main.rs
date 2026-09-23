@@ -10,6 +10,7 @@ mod bresenham;
 mod building_facades;
 mod canopy;
 mod celestial;
+mod chunked;
 mod climate;
 mod clipping;
 mod colors;
@@ -189,6 +190,10 @@ fn run_cli() {
         std::process::exit(1);
     }
 
+    if args.chunk_regions.is_some() {
+        chunked::run(&args);
+    }
+
     // Open up the world floor before anything touches the editor. The bundled packs already
     // grant the full engine range; without this the lower half of it goes unused. The ceiling
     // goes with it: chunk serialization needs the whole dimension span, not just the floor.
@@ -275,6 +280,45 @@ fn run_cli() {
     // chunk of — see CoordTransformer::llbbox_to_xzbbox_with_reference for why that's enough
     // to make separately-run chunks tile together.
     let reference_bbox = args.reference_bbox.unwrap_or(effective_bbox);
+    if reference_bbox != effective_bbox {
+        let (_, local_box) =
+            coordinate_system::transformation::CoordTransformer::llbbox_to_xzbbox_with_reference(
+                &reference_bbox,
+                &effective_bbox,
+                args.scale,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("{} Invalid --reference-bbox: {e}", "Error:".red().bold());
+                std::process::exit(1);
+            });
+        // Terrain must be sized to where this run's objects land, which follows the
+        // reference area's block spacing rather than this bbox's own.
+        elevation::set_world_dims_override(
+            effective_bbox,
+            args.scale,
+            (local_box.max_x() - local_box.min_x()) as usize + 1,
+            (local_box.max_z() - local_box.min_z()) as usize + 1,
+        );
+    }
+    if let Some((min_m, max_m)) = args.elevation_range {
+        elevation::postprocess::set_elevation_range_override(min_m, max_m);
+    }
+    if args.probe_elevation {
+        let _ = ground::generate_ground_data(&args, effective_bbox);
+        match elevation::postprocess::measured_elevation_range() {
+            Some((min_m, max_m)) => {
+                println!("ARNIS_ELEVATION_RANGE {min_m} {max_m}");
+                std::process::exit(0);
+            }
+            None => {
+                eprintln!(
+                    "{} No terrain measured for this bbox.",
+                    "Error:".red().bold()
+                );
+                std::process::exit(1);
+            }
+        }
+    }
 
     // Heads-up for very large areas: generation is long and memory-heavy, and big
     // requests load the public OpenStreetMap / elevation servers. Non-blocking.
@@ -341,14 +385,14 @@ fn run_cli() {
     } else {
         // Java: create a new world in the provided output directory
         let base_dir = args.path.clone().unwrap();
-        let world_path = match world_utils::create_new_world_with_name(&base_dir, args.name.as_deref())
-        {
-            Ok(path) => PathBuf::from(path),
-            Err(e) => {
-                eprintln!("{} {}", "Error:".red().bold(), e);
-                std::process::exit(1);
-            }
-        };
+        let world_path =
+            match world_utils::create_new_world_with_name(&base_dir, args.name.as_deref()) {
+                Ok(path) => PathBuf::from(path),
+                Err(e) => {
+                    eprintln!("{} {}", "Error:".red().bold(), e);
+                    std::process::exit(1);
+                }
+            };
         println!(
             "Created new world at: {}",
             world_path.display().to_string().bright_white().bold()

@@ -330,7 +330,7 @@ fn generate_unique_default_world_name(base_path: &Path) -> String {
 /// `base_path` by appending " (2)", " (3)", etc. Falls back to the default
 /// "Arnis World N" scheme if nothing usable survives sanitization (e.g. the
 /// input was only invalid characters).
-fn generate_unique_custom_world_name(base_path: &Path, raw_name: &str) -> String {
+pub(crate) fn generate_unique_custom_world_name(base_path: &Path, raw_name: &str) -> String {
     generate_unique_custom_world_name_excluding(base_path, raw_name, None)
 }
 
@@ -394,7 +394,7 @@ fn generate_unique_custom_world_name_excluding(
 }
 
 /// Overwrites the `LevelName` field in an existing world's `level.dat`.
-fn update_level_name(world_path: &Path, new_name: &str) -> Result<(), String> {
+pub(crate) fn update_level_name(world_path: &Path, new_name: &str) -> Result<(), String> {
     let level_path = world_path.join("level.dat");
     let level_data = fs::read(&level_path).map_err(|e| format!("Failed to read level.dat: {e}"))?;
 

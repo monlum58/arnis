@@ -729,7 +729,10 @@ pub fn build_context(
     }
 
     Some(SignageContext {
-        registry: DecalRegistry::from_keys(keys),
+        registry: match args.map_id_base {
+            Some(base) => DecalRegistry::from_keys_starting_at(keys, base),
+            None => DecalRegistry::from_keys(keys),
+        },
         level,
         region,
         intersections,

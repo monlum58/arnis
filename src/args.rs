@@ -29,6 +29,34 @@ pub struct Args {
     #[arg(long, allow_hyphen_values = true, value_parser = LLBBox::from_str)]
     pub reference_bbox: Option<LLBBox>,
 
+    /// Real-world height range in metres (MIN,MAX) to map onto the world's block
+    /// height, instead of the range measured from this run's own terrain. Runs
+    /// that are chunks of one world must share it so an altitude gets the same Y
+    /// in all of them.
+    #[arg(long, allow_hyphen_values = true, value_parser = parse_elevation_range)]
+    pub elevation_range: Option<(f64, f64)>,
+
+    /// Measure the terrain's height range for --bbox, print it and exit without
+    /// generating. Used by chunked generation to agree on one --elevation-range.
+    #[arg(long, hide = true)]
+    pub probe_elevation: bool,
+
+    /// First map id for signage decals. Chunks of one world need disjoint ids,
+    /// since their map files end up in the same data folder.
+    #[arg(long, hide = true)]
+    pub map_id_base: Option<i32>,
+
+    /// Generate the area as a grid of chunks of N x N Minecraft regions (512 blocks
+    /// each), one process per chunk, stitched into one world. Memory then scales
+    /// with the chunk size instead of the whole area. Java worlds only.
+    #[arg(long)]
+    pub chunk_regions: Option<u32>,
+
+    /// Extra regions generated around each chunk and then discarded, so terrain
+    /// smoothing and objects crossing a chunk seam see their surroundings.
+    #[arg(long, default_value_t = 1)]
+    pub chunk_margin_regions: u32,
+
     /// JSON file containing OSM data (optional)
     #[arg(long, group = "location")]
     pub file: Option<String>,
@@ -286,6 +314,23 @@ pub struct Args {
     /// replacement one.
     #[arg(long)]
     pub building_facades_dir: Option<PathBuf>,
+}
+
+fn parse_elevation_range(s: &str) -> Result<(f64, f64), String> {
+    let parts: Vec<&str> = s.split(',').map(str::trim).collect();
+    let [min, max] = parts.as_slice() else {
+        return Err(format!("{s}: expected MIN,MAX in metres"));
+    };
+    let min: f64 = min
+        .parse()
+        .map_err(|_| format!("{s}: MIN is not a number"))?;
+    let max: f64 = max
+        .parse()
+        .map_err(|_| format!("{s}: MAX is not a number"))?;
+    if !(min.is_finite() && max.is_finite() && min <= max) {
+        return Err(format!("{s}: need finite MIN <= MAX"));
+    }
+    Ok((min, max))
 }
 
 /// Accepts the panel resolutions the atlas budget logic can halve cleanly.
@@ -619,6 +664,12 @@ pub fn validate_args(args: &Args) -> Result<(), String> {
 
     if args.map_preview && args.luanti {
         return Err("--map-preview is not supported for Luanti worlds.".to_string());
+    }
+
+    // Rotation turns the map around its own centre, so a run over part of the
+    // reference area would stop being a plain shift of the whole.
+    if args.reference_bbox.is_some() && args.rotation != 0.0 {
+        return Err("--reference-bbox cannot be combined with --rotation.".to_string());
     }
 
     // Never shipped working: X gets a cos(lat) factor and Z does not, so the world comes out

@@ -1381,12 +1381,13 @@ fn gaussian_blur_heights_masked(
             .for_each(|(dest_row, y)| {
                 let (row, m_row) = (&heights[y], &masked[y]);
                 let len = row.len().min(m_row.len());
-                dest_row[..len].copy_from_slice(&blur_line(
-                    len,
-                    &kernel,
-                    half,
-                    |i| if m_row[i] { f64::NAN } else { row[i] },
-                ));
+                dest_row[..len].copy_from_slice(&blur_line(len, &kernel, half, |i| {
+                    if m_row[i] {
+                        f64::NAN
+                    } else {
+                        row[i]
+                    }
+                }));
             });
         y0 = y1;
         report(0.5 * (y1 as f64 / h as f64));
@@ -1562,9 +1563,7 @@ pub(crate) fn gaussian_blur_mask_to_f32_reported(
 
     // Vertical pass: f64 throughout (via transpose, same as the other blur
     // variants), cast to f32 only in the final sequential copy below.
-    let blurred = blur_vertical_via_transpose(&after_h, &kernel, half, &|f| {
-        report(0.5 + 0.5 * f)
-    });
+    let blurred = blur_vertical_via_transpose(&after_h, &kernel, half, &|f| report(0.5 + 0.5 * f));
     out.as_flat_mut_slice()
         .par_chunks_mut(w.max(1))
         .zip(blurred.par_iter())
@@ -1700,6 +1699,21 @@ pub fn filter_elevation_outliers(height_grid: &mut MmapGrid<f64>) {
     }
 }
 
+/// Real-world height range (metres) to map onto the block range instead of the
+/// one measured from this run's own terrain. Runs that are chunks of one larger
+/// world must share it, or the same altitude lands at a different Y in each.
+static ELEVATION_RANGE_OVERRIDE: std::sync::Mutex<Option<(f64, f64)>> = std::sync::Mutex::new(None);
+/// The range the last `scale_to_minecraft` call measured, before any override.
+static MEASURED_ELEVATION_RANGE: std::sync::Mutex<Option<(f64, f64)>> = std::sync::Mutex::new(None);
+
+pub fn set_elevation_range_override(min_m: f64, max_m: f64) {
+    *ELEVATION_RANGE_OVERRIDE.lock().unwrap() = Some((min_m, max_m));
+}
+
+pub fn measured_elevation_range() -> Option<(f64, f64)> {
+    *MEASURED_ELEVATION_RANGE.lock().unwrap()
+}
+
 /// Scale raw elevation (meters) to Minecraft Y coordinates, keeping f64 precision.
 /// `extended_max_y` is the cap when `disable_height_limit` is on (Java datapack:
 /// 2031; Bedrock BP: 512; Luanti has no pack, so it keeps the vanilla ceiling);
@@ -1738,6 +1752,14 @@ pub fn scale_to_minecraft(
             || (f64::MAX, f64::MIN),
             |(lo1, hi1), (lo2, hi2)| (lo1.min(lo2), hi1.max(hi2)),
         );
+
+    if min_height.is_finite() && max_height.is_finite() && min_height <= max_height {
+        *MEASURED_ELEVATION_RANGE.lock().unwrap() = Some((min_height, max_height));
+    }
+    let (min_height, max_height) = ELEVATION_RANGE_OVERRIDE
+        .lock()
+        .unwrap()
+        .unwrap_or((min_height, max_height));
 
     let (min_height, height_range) =
         if !min_height.is_finite() || !max_height.is_finite() || min_height >= max_height {

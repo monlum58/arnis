@@ -137,6 +137,7 @@ impl DecalEntry {
 pub struct DecalRegistry {
     entries: HashMap<DecalKey, DecalEntry>,
     ordered: Vec<DecalKey>,
+    first_id: i32,
     next_id: i32,
 }
 
@@ -146,10 +147,18 @@ impl DecalRegistry {
 
     /// Assigns ids to `keys` in their sorted order.
     pub fn from_keys(keys: BTreeSet<DecalKey>) -> Self {
+        Self::from_keys_starting_at(keys, Self::FIRST_ID)
+    }
+
+    /// Like `from_keys`, with the first id at `first_id` (never below `FIRST_ID`), so
+    /// chunks of one world can hand out disjoint ids.
+    pub fn from_keys_starting_at(keys: BTreeSet<DecalKey>, first_id: i32) -> Self {
+        let first_id = first_id.max(Self::FIRST_ID);
         let mut reg = DecalRegistry {
             entries: HashMap::with_capacity(keys.len()),
             ordered: Vec::with_capacity(keys.len()),
-            next_id: Self::FIRST_ID,
+            first_id,
+            next_id: first_id,
         };
         for key in keys {
             let (cols, rows) = key.dims();
@@ -196,7 +205,7 @@ impl DecalRegistry {
 
     /// Number of map files this registry produces.
     pub fn tile_count(&self) -> i32 {
-        self.next_id - Self::FIRST_ID
+        self.next_id - self.first_id
     }
 }
 

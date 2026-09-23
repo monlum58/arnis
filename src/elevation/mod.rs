@@ -77,6 +77,18 @@ pub const MAX_ELEVATION_GRID_DIM: usize = 16384;
 /// and shrinking both axes by the same factor keeps sampling isotropic at the same memory.
 pub const MAX_ELEVATION_GRID_CELLS: usize = MAX_ELEVATION_GRID_DIM * MAX_ELEVATION_GRID_DIM;
 
+/// World size in blocks for one bbox, set when a run's coordinates come from a
+/// `--reference-bbox`. That run's block spacing is the reference area's, so its
+/// own `geo_distance` (taken at its own mean latitude) would size the terrain
+/// grid slightly differently from where its objects land. Keyed on the exact
+/// bbox and scale so nothing else computing dims is affected.
+static WORLD_DIMS_OVERRIDE: std::sync::Mutex<Option<(LLBBox, f64, usize, usize)>> =
+    std::sync::Mutex::new(None);
+
+pub fn set_world_dims_override(bbox: LLBBox, scale: f64, world_width: usize, world_height: usize) {
+    *WORLD_DIMS_OVERRIDE.lock().unwrap() = Some((bbox, scale, world_width, world_height));
+}
+
 /// Compute world and grid dimensions for the given bbox and scale.
 ///
 /// Exposed so callers (e.g. `Ground::new_enabled`) can fetch land cover at the
@@ -84,14 +96,19 @@ pub const MAX_ELEVATION_GRID_CELLS: usize = MAX_ELEVATION_GRID_DIM * MAX_ELEVATI
 ///
 /// Returns `(world_width, world_height, grid_width, grid_height)`.
 pub fn compute_grid_dims(bbox: &LLBBox, scale: f64) -> (usize, usize, usize, usize) {
-    let (base_scale_z, base_scale_x) = geo_distance(bbox.min(), bbox.max());
-    // Apply same floor() and scale operations as CoordTransformer.llbbox_to_xzbbox()
-    let scale_factor_z: f64 = base_scale_z.floor() * scale;
-    let scale_factor_x: f64 = base_scale_x.floor() * scale;
-    // World block positions span 0..=scale_factor (inclusive), so there are
-    // scale_factor+1 distinct positions.
-    let world_width: usize = scale_factor_x as usize + 1;
-    let world_height: usize = scale_factor_z as usize + 1;
+    let overridden = *WORLD_DIMS_OVERRIDE.lock().unwrap();
+    let (world_width, world_height) = match overridden {
+        Some((b, s, w, h)) if b == *bbox && s == scale => (w, h),
+        _ => {
+            let (base_scale_z, base_scale_x) = geo_distance(bbox.min(), bbox.max());
+            // Apply same floor() and scale operations as CoordTransformer.llbbox_to_xzbbox()
+            let scale_factor_z: f64 = base_scale_z.floor() * scale;
+            let scale_factor_x: f64 = base_scale_x.floor() * scale;
+            // World block positions span 0..=scale_factor (inclusive), so there are
+            // scale_factor+1 distinct positions.
+            (scale_factor_x as usize + 1, scale_factor_z as usize + 1)
+        }
+    };
 
     // One elevation sample per block is the ideal: finer buys nothing (a block is the
     // smallest representable unit), coarser blurs the terrain. Only shrink below that when

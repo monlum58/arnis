@@ -30,7 +30,10 @@ fn region_files(world_dir: &Path) -> Vec<(isize, isize, PathBuf)> {
         .unwrap_or_else(|e| panic!("read region dir {}: {e}", region_dir.display()))
     {
         let entry = entry.expect("read region dir entry");
-        let name = entry.file_name().into_string().expect("region filename is valid UTF-8");
+        let name = entry
+            .file_name()
+            .into_string()
+            .expect("region filename is valid UTF-8");
         // r.<x>.<z>.mca
         let parts: Vec<&str> = name.trim_end_matches(".mca").split('.').collect();
         if parts.len() == 3 && parts[0] == "r" {
@@ -71,6 +74,10 @@ fn main() {
     let mut diff_examples: Vec<String> = vec![];
     let mut old_only_nonair: u64 = 0;
     let mut new_only_nonair: u64 = 0;
+    // Where the differences are, so a nonzero total can be located.
+    let mut by_region: std::collections::BTreeMap<(isize, isize), u64> = Default::default();
+    let mut by_band: std::collections::BTreeMap<isize, u64> = Default::default();
+    let mut by_pair: std::collections::HashMap<(String, String), u64> = Default::default();
 
     for (rx, rz, old_path) in &old_regions {
         let new_path = new_dir.join("region").join(format!("r.{rx}.{rz}.mca"));
@@ -90,8 +97,9 @@ fn main() {
                     (Some(o), Some(n)) => (o, n),
                     (None, None) => continue,
                     _ => {
-                        diff_examples
-                            .push(format!("chunk r.{rx}.{rz} ({cx},{cz}): one side missing entirely"));
+                        diff_examples.push(format!(
+                            "chunk r.{rx}.{rz} ({cx},{cz}): one side missing entirely"
+                        ));
                         total_diffs += 1;
                         continue;
                     }
@@ -107,15 +115,25 @@ fn main() {
                 for lx in 0..16usize {
                     for lz in 0..16usize {
                         for y in y_start..y_end {
-                            let on = old_chunk.block(lx, y, lz).map(|b| b.name()).unwrap_or("air");
-                            let nn = new_chunk.block(lx, y, lz).map(|b| b.name()).unwrap_or("air");
+                            let on = old_chunk
+                                .block(lx, y, lz)
+                                .map(|b| b.name())
+                                .unwrap_or("air");
+                            let nn = new_chunk
+                                .block(lx, y, lz)
+                                .map(|b| b.name())
+                                .unwrap_or("air");
                             total_compared += 1;
                             if on != nn {
                                 total_diffs += 1;
+                                *by_region.entry((*rx, *rz)).or_default() += 1;
+                                *by_band.entry(y.div_euclid(16) * 16).or_default() += 1;
+                                *by_pair.entry((on.to_string(), nn.to_string())).or_default() += 1;
                                 if diff_examples.len() < 20 {
                                     let wx = *rx * 512 + (cx as isize) * 16 + lx as isize;
                                     let wz = *rz * 512 + (cz as isize) * 16 + lz as isize;
-                                    diff_examples.push(format!("({wx},{y},{wz}): old={on} new={nn}"));
+                                    diff_examples
+                                        .push(format!("({wx},{y},{wz}): old={on} new={nn}"));
                                 }
                             }
                         }
@@ -151,6 +169,22 @@ fn main() {
     println!("non-air blocks in new-only Y range (outside overlap): {new_only_nonair}");
     for d in &diff_examples {
         println!("  {d}");
+    }
+    if total_diffs > 0 {
+        println!("differences by region:");
+        for ((x, z), n) in &by_region {
+            println!("  r.{x}.{z}: {n}");
+        }
+        println!("differences by 16-block Y band:");
+        for (y, n) in &by_band {
+            println!("  y {y}..{}: {n}", y + 15);
+        }
+        let mut pairs: Vec<_> = by_pair.into_iter().collect();
+        pairs.sort_by(|a, b| b.1.cmp(&a.1));
+        println!("most common changes:");
+        for ((o, n), c) in pairs.iter().take(12) {
+            println!("  {c}: {o} -> {n}");
+        }
     }
 
     mismatch |= total_diffs > 0 || old_only_nonair > 0 || new_only_nonair > 0;
