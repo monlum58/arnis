@@ -15,6 +15,7 @@ pub fn generate_example(llbbox: LLBBox) -> (XZBBox, Vec<ProcessedElement>) {
         osm_parser::parse_osm_data(
             raw_data,
             llbbox,
+            llbbox,
             1.0,
             false,
             crate::projection::ProjectionKind::Local,

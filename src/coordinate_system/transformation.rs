@@ -72,6 +72,50 @@ impl CoordTransformer {
         ))
     }
 
+    /// Like `llbbox_to_xzbbox`, but the transform's origin and scale come from
+    /// `reference_bbox` while the returned `XZBBox` covers only `processing_bbox`
+    /// — the sub-area actually being fetched/generated. Because the "Local" mode's
+    /// per-point formula (`transform_point`) depends on nothing but the four
+    /// numbers this derives from `reference_bbox` (origin, spans, scale factors),
+    /// two calls sharing the same `reference_bbox` produce coordinates for the
+    /// same real-world point that agree exactly — the basis for generating one
+    /// large area as several smaller, independently-run, memory-bounded chunks
+    /// that still tile together into one coherent world. `reference_bbox` ==
+    /// `processing_bbox` (i.e. plain `llbbox_to_xzbbox`) is the single-run case.
+    pub fn llbbox_to_xzbbox_with_reference(
+        reference_bbox: &LLBBox,
+        processing_bbox: &LLBBox,
+        scale: f64,
+    ) -> Result<(CoordTransformer, XZBBox), String> {
+        let (transformer, _) = Self::llbbox_to_xzbbox(reference_bbox, scale)?;
+
+        let corners = [
+            LLPoint::new(processing_bbox.min().lat(), processing_bbox.min().lng()),
+            LLPoint::new(processing_bbox.min().lat(), processing_bbox.max().lng()),
+            LLPoint::new(processing_bbox.max().lat(), processing_bbox.min().lng()),
+            LLPoint::new(processing_bbox.max().lat(), processing_bbox.max().lng()),
+        ];
+        let mut x_min = i32::MAX;
+        let mut x_max = i32::MIN;
+        let mut z_min = i32::MAX;
+        let mut z_max = i32::MIN;
+        for corner in corners {
+            let Ok(corner) = corner else {
+                return Err("llbbox_to_xzbbox_with_reference: invalid processing_bbox corner".to_string());
+            };
+            let p = transformer.transform_point(corner);
+            x_min = x_min.min(p.x);
+            x_max = x_max.max(p.x);
+            z_min = z_min.min(p.z);
+            z_max = z_max.max(p.z);
+        }
+
+        let xzbbox = XZBBox::rect_from_min_max(x_min, z_min, x_max, z_max)
+            .map_err(|e| format!("Failed to create XZBBox from reference transform: {e}"))?;
+
+        Ok((transformer, xzbbox))
+    }
+
     /// Create a `CoordTransformer` using a Web Mercator projection.
     ///
     /// The bounding box is computed by projecting all four corners of the
@@ -223,6 +267,74 @@ pub fn lat_lon_to_minecraft_coords(
     let z: i32 = (rel_z * scale_factor_z) as i32;
 
     (x, z)
+}
+
+#[cfg(test)]
+mod chunking_tests {
+    use super::*;
+    use crate::test_utilities::get_llbbox_arnis;
+
+    // The premise a chunked large-area generation would rely on: two chunks that
+    // share the same reference_bbox must agree, exactly, on where any given
+    // real-world point lands - otherwise their separately-generated worlds would
+    // not tile together. `transform_point` depends only on the transformer's
+    // reference-derived fields, never on which chunk built it, so this should
+    // hold for every point, not just ones on the shared seam.
+    #[test]
+    fn transformers_sharing_a_reference_bbox_agree_on_every_point() {
+        let reference = get_llbbox_arnis();
+        let mid_lng = (reference.min().lng() + reference.max().lng()) / 2.0;
+
+        let chunk_a = LLBBox::new(
+            reference.min().lat(),
+            reference.min().lng(),
+            reference.max().lat(),
+            mid_lng,
+        )
+        .unwrap();
+        let chunk_b = LLBBox::new(
+            reference.min().lat(),
+            mid_lng,
+            reference.max().lat(),
+            reference.max().lng(),
+        )
+        .unwrap();
+
+        let (transformer_a, xzbbox_a) =
+            CoordTransformer::llbbox_to_xzbbox_with_reference(&reference, &chunk_a, 1.0).unwrap();
+        let (transformer_b, xzbbox_b) =
+            CoordTransformer::llbbox_to_xzbbox_with_reference(&reference, &chunk_b, 1.0).unwrap();
+
+        // A handful of real-world points, including ones on the shared seam and ones
+        // each chunk would never itself fetch data for (outside its own bbox) - the
+        // point of a shared reference is that the *mapping* doesn't care.
+        let probe_points = [
+            LLPoint::new(reference.min().lat(), mid_lng).unwrap(),
+            LLPoint::new(reference.max().lat(), mid_lng).unwrap(),
+            LLPoint::new(
+                (reference.min().lat() + reference.max().lat()) / 2.0,
+                mid_lng,
+            )
+            .unwrap(),
+            LLPoint::new(reference.min().lat(), reference.min().lng()).unwrap(),
+            LLPoint::new(reference.max().lat(), reference.max().lng()).unwrap(),
+        ];
+        for point in probe_points {
+            assert_eq!(
+                transformer_a.transform_point(point),
+                transformer_b.transform_point(point),
+                "chunk A and chunk B transformers disagree on {point:?} despite sharing a reference_bbox"
+            );
+        }
+
+        // The two chunks' own extents must tile without a gap or overlap: chunk A's
+        // east edge is chunk B's west edge, in the shared coordinate space.
+        assert_eq!(
+            xzbbox_a.max_x(),
+            xzbbox_b.min_x(),
+            "chunk A's east edge must exactly meet chunk B's west edge"
+        );
+    }
 }
 
 #[cfg(test)]

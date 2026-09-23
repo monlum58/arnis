@@ -20,6 +20,15 @@ pub struct Args {
     #[arg(long, allow_hyphen_values = true, value_parser = LLBBox::from_str)]
     pub bbox: Option<LLBBox>,
 
+    /// Bounding box the coordinate system is anchored to (min_lat,min_lng,max_lat,max_lng),
+    /// instead of --bbox. Lets --bbox cover only a sub-area to fetch/generate while every
+    /// real-world point still maps to the same Minecraft coordinate it would in a run over
+    /// the full --reference-bbox — the basis for splitting one large area into several
+    /// smaller, independently-run chunks that tile into one coherent world. Defaults to
+    /// --bbox itself (today's behavior) when omitted.
+    #[arg(long, allow_hyphen_values = true, value_parser = LLBBox::from_str)]
+    pub reference_bbox: Option<LLBBox>,
+
     /// JSON file containing OSM data (optional)
     #[arg(long, group = "location")]
     pub file: Option<String>,

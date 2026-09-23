@@ -105,7 +105,8 @@ fn world_xz(lat: f64, lon: f64, llbbox: LLBBox, args: &Args) -> Option<(i32, i32
             CoordTransformer::with_projection(&llbbox, args.scale, &proj)
         }
         crate::projection::ProjectionKind::Local => {
-            CoordTransformer::llbbox_to_xzbbox(&llbbox, args.scale)
+            let reference_bbox = args.reference_bbox.unwrap_or(llbbox);
+            CoordTransformer::llbbox_to_xzbbox_with_reference(&reference_bbox, &llbbox, args.scale)
         }
     }
     .ok()?;

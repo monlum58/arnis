@@ -899,6 +899,7 @@ pub fn arch_era_from_hint(hint: StyleHint) -> ArchEra {
 pub fn parse_osm_data(
     osm_data: OsmData,
     bbox: LLBBox,
+    reference_bbox: LLBBox,
     scale: f64,
     debug: bool,
     projection: crate::projection::ProjectionKind,
@@ -922,7 +923,7 @@ pub fn parse_osm_data(
             CoordTransformer::with_projection(&bbox, scale, &proj)
         }
         crate::projection::ProjectionKind::Local => {
-            CoordTransformer::llbbox_to_xzbbox(&bbox, scale)
+            CoordTransformer::llbbox_to_xzbbox_with_reference(&reference_bbox, &bbox, scale)
         }
     }
     // Panics rather than exits: the GUI calls this from a Tauri blocking task, where an

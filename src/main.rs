@@ -270,6 +270,12 @@ fn run_cli() {
         }
     };
 
+    // The bbox every coordinate transform in this run anchors to. Equal to effective_bbox
+    // (today's behavior) unless --reference-bbox names a larger area this run is only one
+    // chunk of — see CoordTransformer::llbbox_to_xzbbox_with_reference for why that's enough
+    // to make separately-run chunks tile together.
+    let reference_bbox = args.reference_bbox.unwrap_or(effective_bbox);
+
     // Heads-up for very large areas: generation is long and memory-heavy, and big
     // requests load the public OpenStreetMap / elevation servers. Non-blocking.
     {
@@ -406,6 +412,7 @@ fn run_cli() {
             let data = if args.overture && !skip_objects {
                 overture::fetch_overture_buildings(
                     &effective_bbox,
+                    &reference_bbox,
                     args.scale,
                     args.overture_source,
                     args.debug,
@@ -466,6 +473,7 @@ fn run_cli() {
         osm_parser::parse_osm_data(
             raw_data,
             effective_bbox,
+            reference_bbox,
             args.scale,
             args.debug,
             args.projection,
@@ -574,7 +582,11 @@ fn run_cli() {
                     CoordTransformer::with_projection(&effective_bbox, args.scale, &proj)
                 }
                 projection::ProjectionKind::Local => {
-                    CoordTransformer::llbbox_to_xzbbox(&effective_bbox, args.scale)
+                    CoordTransformer::llbbox_to_xzbbox_with_reference(
+                        &reference_bbox,
+                        &effective_bbox,
+                        args.scale,
+                    )
                 }
             }
             .unwrap_or_else(|e| {

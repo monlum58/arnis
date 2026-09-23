@@ -526,11 +526,12 @@ pub struct OvertureData {
 /// conflated heights survive in `hints`.
 pub fn fetch_overture_buildings(
     bbox: &LLBBox,
+    reference_bbox: &LLBBox,
     scale: f64,
     source: OvertureSource,
     debug: bool,
 ) -> OvertureData {
-    match fetch_overture_buildings_inner(bbox, scale, source, debug) {
+    match fetch_overture_buildings_inner(bbox, reference_bbox, scale, source, debug) {
         Ok(data) => data,
         Err(e) => {
             eprintln!(
@@ -933,6 +934,7 @@ fn collect_from_parquet(
 
 fn fetch_overture_buildings_inner(
     bbox: &LLBBox,
+    reference_bbox: &LLBBox,
     scale: f64,
     source: OvertureSource,
     debug: bool,
@@ -956,7 +958,8 @@ fn fetch_overture_buildings_inner(
     }
 
     // Convert to ProcessedElements and clip to xzbbox (matching OSM clipping)
-    let (coord_transformer, xzbbox) = CoordTransformer::llbbox_to_xzbbox(bbox, scale)?;
+    let (coord_transformer, xzbbox) =
+        CoordTransformer::llbbox_to_xzbbox_with_reference(reference_bbox, bbox, scale)?;
 
     let elements: Vec<ProcessedElement> = all_buildings
         .into_iter()
