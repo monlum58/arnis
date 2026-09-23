@@ -41,6 +41,11 @@ pub struct Args {
     #[arg(long, hide = true)]
     pub probe_elevation: bool,
 
+    /// Terrain base Y to use instead of the one this run derives from its own
+    /// water depth. Chunks of one world must share it.
+    #[arg(long, hide = true, allow_hyphen_values = true)]
+    pub terrain_base: Option<i32>,
+
     /// First map id for signage decals. Chunks of one world need disjoint ids,
     /// since their map files end up in the same data folder.
     #[arg(long, hide = true)]

@@ -303,11 +303,15 @@ fn run_cli() {
     if let Some((min_m, max_m)) = args.elevation_range {
         elevation::postprocess::set_elevation_range_override(min_m, max_m);
     }
+    if let Some(base) = args.terrain_base {
+        ground::set_terrain_base_override(base);
+    }
     if args.probe_elevation {
-        let _ = ground::generate_ground_data(&args, effective_bbox);
+        let ground = ground::generate_ground_data(&args, effective_bbox);
         match elevation::postprocess::measured_elevation_range() {
             Some((min_m, max_m)) => {
                 println!("ARNIS_ELEVATION_RANGE {min_m} {max_m}");
+                println!("ARNIS_TERRAIN_BASE {}", ground.base_level());
                 std::process::exit(0);
             }
             None => {

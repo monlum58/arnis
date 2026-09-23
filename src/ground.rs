@@ -265,6 +265,11 @@ impl Ground {
             // The terrain may sink to reach an extended floor, but never below the carve floor:
             // water would otherwise be cut straight through the bedrock layer.
             let sink_floor = min_ground_level.max(carve_floor).min(water_floor);
+            // Chunks of one world must share a base, or their terrain sits at different Y.
+            let (water_floor, sink_floor) = match *TERRAIN_BASE_OVERRIDE.lock().unwrap() {
+                Some(base) => (base, base),
+                None => (water_floor, sink_floor),
+            };
 
             let source_mode = if !body.is_earth() {
                 crate::elevation::SourceMode::Planetary(body)
@@ -1054,6 +1059,15 @@ fn filler_block_for(body: CelestialBody) -> crate::block_definitions::Block {
 /// 2031 for the Java datapack, 512 for the Bedrock behavior pack, and the vanilla
 /// ceiling for Luanti, which has no pack and whose spawn search only scans the
 /// vanilla range. Must stay gated like `world_top_y_for` / `extended_min_y_for`.
+/// Terrain base Y to use instead of the one derived from this run's own water
+/// (the deepest carve it has to leave room for). Chunks of one world must share
+/// it; the chunked driver passes the highest base any chunk needs.
+static TERRAIN_BASE_OVERRIDE: std::sync::Mutex<Option<i32>> = std::sync::Mutex::new(None);
+
+pub(crate) fn set_terrain_base_override(base: i32) {
+    *TERRAIN_BASE_OVERRIDE.lock().unwrap() = Some(base);
+}
+
 pub(crate) fn extended_max_y_for(args: &Args) -> i32 {
     if args.bedrock {
         512

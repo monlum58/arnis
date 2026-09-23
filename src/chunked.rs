@@ -32,6 +32,7 @@ const DRIVER_FLAGS: &[(&str, bool)] = &[
     ("--reference-bbox", true),
     ("--elevation-range", true),
     ("--probe-elevation", false),
+    ("--terrain-base", true),
     ("--map-id-base", true),
     ("--chunk-regions", true),
     ("--chunk-margin-regions", true),
@@ -187,12 +188,16 @@ pub fn run(args: &Args) -> ! {
         bbox.max().lng()
     );
 
-    // Phase 1: one height range for the whole world.
-    let elevation_range = match args.elevation_range {
-        Some(r) => Some(r),
-        None if args.terrain() => {
-            let mut lo = f64::INFINITY;
-            let mut hi = f64::NEG_INFINITY;
+    // Phase 1: one height range and one terrain base for the whole world. The
+    // base is the highest any chunk needs: each derives it from the deepest
+    // water it must carve, and a higher base only leaves more room below.
+    let mut elevation_range = args.elevation_range;
+    let mut terrain_base = args.terrain_base;
+    if args.terrain() && (elevation_range.is_none() || terrain_base.is_none()) {
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        let mut base = i32::MIN;
+        {
             for plan in &plans {
                 println!(
                     "{} measuring terrain height, chunk {}/{}...",
@@ -226,15 +231,23 @@ pub fn run(args: &Args) -> ! {
                     }
                     _ => fail(format!("bad terrain probe output: {line}")),
                 }
+                let chunk_base = stdout
+                    .lines()
+                    .find_map(|l| l.strip_prefix("ARNIS_TERRAIN_BASE "))
+                    .and_then(|v| v.trim().parse::<i32>().ok())
+                    .unwrap_or_else(|| fail("terrain probe printed no base"));
+                base = base.max(chunk_base);
             }
-            println!(
-                "{} shared height range {lo:.1} m .. {hi:.1} m",
-                "[chunks]".bold()
-            );
-            Some((lo, hi))
         }
-        None => None,
-    };
+        let range = *elevation_range.get_or_insert((lo, hi));
+        let base = *terrain_base.get_or_insert(base);
+        println!(
+            "{} shared height range {:.1} m .. {:.1} m, terrain base y={base}",
+            "[chunks]".bold(),
+            range.0,
+            range.1
+        );
+    }
 
     // Phase 2: generate each chunk and move its owned regions into the world.
     let mut next_map_id = crate::decals::registry::DecalRegistry::FIRST_ID;
@@ -267,6 +280,9 @@ pub fn run(args: &Args) -> ! {
             .arg("chunk");
         if let Some((lo, hi)) = elevation_range {
             cmd.arg(format!("--elevation-range={lo},{hi}"));
+        }
+        if let Some(base) = terrain_base {
+            cmd.arg(format!("--terrain-base={base}"));
         }
         let status = cmd
             .status()
