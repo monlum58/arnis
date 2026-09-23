@@ -62,6 +62,11 @@ pub struct Args {
     #[arg(long, default_value_t = 1)]
     pub chunk_margin_regions: u32,
 
+    /// How many chunks measure their terrain height at once before generation.
+    /// Each measurement is a separate process of a few GB at 16x16 regions.
+    #[arg(long, default_value_t = 4)]
+    pub chunk_probe_jobs: u32,
+
     /// JSON file containing OSM data (optional)
     #[arg(long, group = "location")]
     pub file: Option<String>,

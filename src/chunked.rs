@@ -37,6 +37,7 @@ const DRIVER_FLAGS: &[(&str, bool)] = &[
     ("--map-id-base", true),
     ("--chunk-regions", true),
     ("--chunk-margin-regions", true),
+    ("--chunk-probe-jobs", true),
 ];
 
 /// One chunk: the regions it owns and the block range it generates.
@@ -150,6 +151,10 @@ struct RunState {
     terrain_base: Option<i32>,
     next_map_id: i32,
     chunks_done: usize,
+    /// Height range and terrain base measured per chunk, by chunk index, so an
+    /// interrupted measuring phase keeps what it already has.
+    #[serde(default)]
+    probes: Vec<Option<((f64, f64), i32)>>,
 }
 
 impl RunState {
@@ -176,23 +181,34 @@ impl RunState {
 /// should not stop a run that takes a day.
 const CHUNK_ATTEMPTS: u32 = 3;
 
-fn with_retries<T>(label: &str, mut attempt: impl FnMut() -> Result<T, String>) -> T {
-    for n in 1..=CHUNK_ATTEMPTS {
+fn try_with_retries<T>(
+    label: &str,
+    mut attempt: impl FnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    let mut n = 1;
+    loop {
         match attempt() {
-            Ok(v) => return v,
+            Ok(v) => return Ok(v),
             Err(e) if n < CHUNK_ATTEMPTS => {
                 eprintln!(
                     "{} {label} failed ({e}); retrying in 60 s ({n}/{CHUNK_ATTEMPTS})",
                     "Warning:".yellow().bold()
                 );
                 std::thread::sleep(std::time::Duration::from_secs(60));
+                n += 1;
             }
-            Err(e) => fail(format!(
-                "{label} failed {CHUNK_ATTEMPTS} times ({e}). Run the same command again to resume."
-            )),
+            Err(e) => {
+                return Err(format!(
+                    "{label} failed {CHUNK_ATTEMPTS} times ({e}). \
+                     Run the same command again to resume."
+                ))
+            }
         }
     }
-    unreachable!()
+}
+
+fn with_retries<T>(label: &str, attempt: impl FnMut() -> Result<T, String>) -> T {
+    try_with_retries(label, attempt).unwrap_or_else(|e| fail(e))
 }
 
 /// Runs the whole chunked generation and exits.
@@ -285,6 +301,7 @@ pub fn run(args: &Args) -> ! {
                 terrain_base: args.terrain_base,
                 next_map_id: crate::decals::registry::DecalRegistry::FIRST_ID,
                 chunks_done: 0,
+                probes: Vec::new(),
             };
             state.save(&state_path);
             state
@@ -307,38 +324,87 @@ pub fn run(args: &Args) -> ! {
     let needs_probe =
         args.terrain() && (state.elevation_range.is_none() || state.terrain_base.is_none());
     if needs_probe && !state.probed {
-        let mut lo = f64::INFINITY;
-        let mut hi = f64::NEG_INFINITY;
-        let mut base = i32::MIN;
-        for plan in &plans {
-            println!(
-                "{} measuring terrain height, chunk {}/{}...",
-                "[chunks]".bold(),
-                plan.index + 1,
-                plans.len()
-            );
-            let label = format!("terrain probe for chunk {}", plan.index + 1);
-            let (range, chunk_base) = with_retries(&label, || {
-                let output = Command::new(&exe)
-                    .args(&passthrough)
-                    .arg(format!("--bbox={}", bbox_arg(&reference, plan)))
-                    .arg(format!("--reference-bbox={ref_arg}"))
-                    .arg("--probe-elevation")
-                    .arg("--output-dir")
-                    .arg(&scratch)
-                    .stderr(Stdio::inherit())
-                    .output()
-                    .map_err(|e| e.to_string())?;
-                if !output.status.success() {
-                    return Err(output.status.to_string());
+        state.probes.resize(plans.len(), None);
+        let todo: Vec<&ChunkPlan> = plans
+            .iter()
+            .filter(|p| state.probes[p.index].is_none())
+            .collect();
+        let jobs = (args.chunk_probe_jobs.max(1) as usize).min(todo.len().max(1));
+        println!(
+            "{} measuring terrain height of {} chunk(s), {jobs} at a time ({} already measured)...",
+            "[chunks]".bold(),
+            todo.len(),
+            plans.len() - todo.len()
+        );
+
+        // Workers pull chunks off a shared counter and report back here, where
+        // each result is saved as it arrives. After a failure no new probes
+        // start; the running ones finish and are saved too.
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut failure = None;
+        std::thread::scope(|s| {
+            for _ in 0..jobs {
+                let tx = tx.clone();
+                let (next, stop, todo) = (&next, &stop, &todo);
+                let (exe, passthrough, reference, ref_arg, scratch) =
+                    (&exe, &passthrough, &reference, &ref_arg, &scratch);
+                s.spawn(move || loop {
+                    if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        return;
+                    }
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let Some(plan) = todo.get(i) else { return };
+                    let label = format!("terrain probe for chunk {}", plan.index + 1);
+                    let result = try_with_retries(&label, || {
+                        let output = Command::new(exe)
+                            .args(passthrough)
+                            .arg(format!("--bbox={}", bbox_arg(reference, plan)))
+                            .arg(format!("--reference-bbox={ref_arg}"))
+                            .arg("--probe-elevation")
+                            .arg("--output-dir")
+                            .arg(scratch)
+                            .stderr(Stdio::inherit())
+                            .output()
+                            .map_err(|e| e.to_string())?;
+                        if !output.status.success() {
+                            return Err(output.status.to_string());
+                        }
+                        parse_probe(&String::from_utf8_lossy(&output.stdout))
+                    });
+                    if result.is_err() {
+                        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    if tx.send((plan.index, result)).is_err() {
+                        return;
+                    }
+                });
+            }
+            drop(tx);
+            for (index, result) in rx {
+                match result {
+                    Ok(probe) => {
+                        state.probes[index] = Some(probe);
+                        state.save(&state_path);
+                        let measured = state.probes.iter().filter(|p| p.is_some()).count();
+                        println!(
+                            "{} measured chunk {} ({measured}/{})",
+                            "[chunks]".bold(),
+                            index + 1,
+                            plans.len()
+                        );
+                    }
+                    Err(e) => failure = Some(e),
                 }
-                parse_probe(&String::from_utf8_lossy(&output.stdout))
-            });
-            lo = lo.min(range.0);
-            hi = hi.max(range.1);
-            base = base.max(chunk_base);
+            }
+        });
+        if let Some(e) = failure {
+            fail(e);
         }
-        state.elevation_range.get_or_insert((lo, hi));
+
+        let (range, base) = combine_probes(state.probes.iter().flatten());
+        state.elevation_range.get_or_insert(range);
         state.terrain_base.get_or_insert(base);
         state.probed = true;
         state.save(&state_path);
@@ -417,6 +483,16 @@ pub fn run(args: &Args) -> ! {
         final_world.display()
     );
     std::process::exit(0);
+}
+
+/// One height range covering every chunk, and the highest terrain base any
+/// chunk needs: each derives its base from the deepest water it must carve,
+/// and a higher base only leaves more room below.
+fn combine_probes<'a>(probes: impl Iterator<Item = &'a ((f64, f64), i32)>) -> ((f64, f64), i32) {
+    probes.fold(
+        ((f64::INFINITY, f64::NEG_INFINITY), i32::MIN),
+        |((lo, hi), base), &((a, b), c)| ((lo.min(a), hi.max(b)), base.max(c)),
+    )
 }
 
 /// The height range and terrain base a `--probe-elevation` child printed.
@@ -557,6 +633,12 @@ mod tests {
     }
 
     #[test]
+    fn combined_probe_covers_every_chunk() {
+        let probes = [((10.0, 50.0), -8), ((-2.0, 30.0), -20), ((5.0, 900.0), -12)];
+        assert_eq!(combine_probes(probes.iter()), ((-2.0, 900.0), -8));
+    }
+
+    #[test]
     fn run_state_survives_a_save_and_load() {
         let dir = std::env::temp_dir().join(format!("arnis-state-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -574,6 +656,7 @@ mod tests {
             terrain_base: Some(-20),
             next_map_id: 57,
             chunks_done: 3,
+            probes: vec![None, Some(((1.0, 2.0), -5))],
         };
         state.save(&path);
         let back = RunState::load(&path).unwrap();
@@ -582,6 +665,7 @@ mod tests {
         assert_eq!(back.terrain_base, Some(-20));
         assert_eq!(back.next_map_id, 57);
         assert_eq!(back.chunks_done, 3);
+        assert_eq!(back.probes, state.probes);
         assert!(!path.with_extension("json.tmp").exists());
         fs::remove_file(&path).unwrap();
         fs::remove_dir(&dir).unwrap();
