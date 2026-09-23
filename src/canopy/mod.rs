@@ -23,6 +23,35 @@ const CACHE_DIR: &str = "arnis-canopy-cache";
 /// Caps how much of the download is held at once, at one request per batch.
 const FETCH_BATCH_BYTES: u64 = 16 << 20;
 
+/// Tries per range request. A slow link times a 16 MB batch out now and then,
+/// and without a retry one timeout drops the whole tile.
+const FETCH_ATTEMPTS: u32 = 4;
+
+/// Per request. Long enough for a 16 MB batch at ~100 KB/s.
+const REQUEST_TIMEOUT_SECS: u64 = 300;
+
+/// Set when the caller needs canopy or nothing: a download failure (other than
+/// a tile that does not exist) then ends the process with an error instead of
+/// falling back to land-cover trees. Chunked generation sets it for its chunk
+/// processes, so a flaky download retries the chunk rather than giving it a
+/// different tree style from its neighbours.
+pub const REQUIRE_CANOPY_ENV: &str = "ARNIS_REQUIRE_CANOPY";
+
+static SKIP_CANOPY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Skip canopy downloads in this process (terrain probes never use them).
+pub fn skip() {
+    SKIP_CANOPY.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+const TILE_OUTSIDE: &str = "tile covers none of the area";
+
+/// A failure that means the data does not exist, as opposed to a download
+/// that went wrong. The source has no tiles over open sea (HTTP 404).
+fn is_missing_data(error: &str) -> bool {
+    error.contains("HTTP 404") || error.contains("HTTP 403") || error == TILE_OUTSIDE
+}
+
 /// No measurement here. A measured zero means bare ground.
 pub const CANOPY_NODATA: u8 = 255;
 
@@ -218,19 +247,32 @@ fn fetch_range(
         return Ok(Vec::new());
     }
     let end = start + length - 1;
-    let response = client
-        .get(url)
-        .header("Range", format!("bytes={start}-{end}"))
-        .send()
-        .map_err(|e| e.to_string())?;
-    // A 200 here would mean the server ignored the range and is sending 450 MB.
-    if response.status().as_u16() != 206 {
-        return Err(format!("HTTP {} (expected 206)", response.status()));
+    let mut attempt = 1;
+    loop {
+        let result = client
+            .get(url)
+            .header("Range", format!("bytes={start}-{end}"))
+            .send()
+            .map_err(|e| e.to_string())
+            .and_then(|response| {
+                // A 200 here would mean the server ignored the range and is
+                // sending 450 MB.
+                if response.status().as_u16() != 206 {
+                    return Err(format!("HTTP {} (expected 206)", response.status()));
+                }
+                response
+                    .bytes()
+                    .map(|b| b.to_vec())
+                    .map_err(|e| e.to_string())
+            });
+        match result {
+            Err(e) if !is_missing_data(&e) && attempt < FETCH_ATTEMPTS => {
+                std::thread::sleep(std::time::Duration::from_secs(5 << attempt));
+                attempt += 1;
+            }
+            other => return other,
+        }
     }
-    response
-        .bytes()
-        .map(|b| b.to_vec())
-        .map_err(|e| e.to_string())
 }
 
 impl StripIndex {
@@ -450,7 +492,7 @@ fn fill_from_tile(
     }
     let gz0 = gz0.unwrap_or(0);
     if cols.is_empty() || rows.is_empty() {
-        return Err("tile covers none of the area".into());
+        return Err(TILE_OUTSIDE.into());
     }
 
     // Several output rows can land on one source row when the grid is coarser.
@@ -511,6 +553,9 @@ pub fn fetch_canopy_data(
     grid_width: usize,
     grid_height: usize,
 ) -> Option<CanopyData> {
+    if SKIP_CANOPY.load(std::sync::atomic::Ordering::SeqCst) {
+        return None;
+    }
     if grid_width == 0 || grid_height == 0 {
         return None;
     }
@@ -518,7 +563,7 @@ pub fn fetch_canopy_data(
     println!("Fetching canopy height data (Meta/WRI 1m global canopy height)...");
 
     let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(90))
+        .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .build()
         .ok()?;
 
@@ -533,6 +578,7 @@ pub fn fetch_canopy_data(
     let (x1, y1) = tile_xy(bbox.min().lat(), bbox.max().lng());
     let mut tiles = 0usize;
     let mut failures: Vec<String> = Vec::new();
+    let mut transient = 0usize;
     for yt in y0.min(y1)..=y0.max(y1) {
         for xt in x0.min(x1)..=x0.max(x1) {
             match fill_from_tile(
@@ -545,11 +591,23 @@ pub fn fetch_canopy_data(
                 grid.as_flat_mut_slice(),
             ) {
                 Ok(_) => tiles += 1,
-                Err(e) => failures.push(format!("{}: {}", quadkey_of(xt, yt), e)),
+                Err(e) => {
+                    if !is_missing_data(&e) {
+                        transient += 1;
+                    }
+                    failures.push(format!("{}: {}", quadkey_of(xt, yt), e))
+                }
             }
         }
     }
 
+    if transient > 0 && std::env::var_os(REQUIRE_CANOPY_ENV).is_some_and(|v| v == "1") {
+        eprintln!(
+            "Error: {transient} canopy tile(s) failed to download ({}). Stopping, so this area is not generated with a different tree style.",
+            failures.first().map(|s| s.chars().take(200).collect::<String>()).unwrap_or_default()
+        );
+        std::process::exit(1);
+    }
     let data = CanopyData::from_mmap_grid(grid, grid_width, grid_height);
     let (covered, canopy, mean, max) = data.stats();
     if covered == 0 {
@@ -695,5 +753,18 @@ mod tests {
         assert_eq!(d.at(9, 0), CANOPY_NODATA);
         let (covered, canopy, _, max) = d.stats();
         assert_eq!((covered, canopy, max), (2, 1, 12));
+    }
+}
+
+#[cfg(test)]
+mod failure_kind_tests {
+    use super::*;
+
+    #[test]
+    fn missing_tiles_are_not_download_failures() {
+        assert!(is_missing_data("HTTP 404 Not Found (expected 206)"));
+        assert!(is_missing_data(TILE_OUTSIDE));
+        assert!(!is_missing_data("error decoding response body"));
+        assert!(!is_missing_data("HTTP 503 Service Unavailable (expected 206)"));
     }
 }

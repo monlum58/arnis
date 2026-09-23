@@ -85,7 +85,9 @@ impl<T: GridElement> MmapGrid<T> {
         let (mmap, file) = if anonymous_grids() {
             (MmapMut::map_anon(byte_len as usize)?, None)
         } else {
-            let file = tempfile::Builder::new().tempfile_in(backing_dir()?)?.into_file();
+            let file = tempfile::Builder::new()
+                .tempfile_in(backing_dir()?)?
+                .into_file();
             file.set_len(byte_len)?;
             // SAFETY: `file` is a fresh temp file created and exclusively held by
             // this process; nothing else can be concurrently mutating it out from
@@ -196,7 +198,10 @@ impl<T: GridElement> MmapGrid<T> {
     pub fn as_flat_mut_slice(&mut self) -> &mut [T] {
         // SAFETY: see `as_flat_slice`; exclusive access follows from `&mut self`.
         unsafe {
-            std::slice::from_raw_parts_mut(self.mmap.as_mut_ptr().cast::<T>(), self.rows * self.cols)
+            std::slice::from_raw_parts_mut(
+                self.mmap.as_mut_ptr().cast::<T>(),
+                self.rows * self.cols,
+            )
         }
     }
 
@@ -298,7 +303,9 @@ impl<T: GridElement> Clone for MmapGrid<T> {
 
 impl<T: GridElement + PartialEq> PartialEq for MmapGrid<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.rows == other.rows && self.cols == other.cols && self.as_flat_slice() == other.as_flat_slice()
+        self.rows == other.rows
+            && self.cols == other.cols
+            && self.as_flat_slice() == other.as_flat_slice()
     }
 }
 

@@ -307,6 +307,8 @@ fn run_cli() {
         ground::set_terrain_base_override(base);
     }
     if args.probe_elevation {
+        // The probe only reads terrain; canopy would be downloaded and dropped.
+        canopy::skip();
         let ground = ground::generate_ground_data(&args, effective_bbox);
         match elevation::postprocess::measured_elevation_range() {
             Some((min_m, max_m)) => {

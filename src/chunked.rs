@@ -161,9 +161,10 @@ struct RunState {
 impl RunState {
     fn load(path: &Path) -> Option<Self> {
         let text = fs::read_to_string(path).ok()?;
-        Some(serde_json::from_str(&text).unwrap_or_else(|e| {
-            fail(format!("unreadable run state {}: {e}", path.display()))
-        }))
+        Some(
+            serde_json::from_str(&text)
+                .unwrap_or_else(|e| fail(format!("unreadable run state {}: {e}", path.display()))),
+        )
     }
 
     /// Written to a temp file and renamed, so a crash mid-write cannot leave a
@@ -269,7 +270,13 @@ pub fn run(args: &Args) -> ! {
     // command must find the unfinished run rather than start a "(2)" beside it.
     let safe_name: String = requested_name
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let scratch = output_dir.join(format!(".{safe_name}.chunks"));
     fs::create_dir_all(&scratch).unwrap_or_else(|e| fail(format!("create scratch dir: {e}")));
@@ -439,6 +446,7 @@ pub fn run(args: &Args) -> ! {
             fs::create_dir_all(&chunk_out).map_err(|e| format!("create chunk dir: {e}"))?;
             let mut cmd = Command::new(&exe);
             cmd.env(ANON_GRIDS_ENV, "1");
+            cmd.env(crate::canopy::REQUIRE_CANOPY_ENV, "1");
             cmd.args(&passthrough)
                 .arg(format!("--bbox={}", bbox_arg(&reference, plan)))
                 .arg(format!("--reference-bbox={ref_arg}"))
