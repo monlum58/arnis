@@ -16,6 +16,7 @@
 use crate::args::Args;
 use crate::coordinate_system::transformation::CoordTransformer;
 use colored::Colorize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -127,6 +128,73 @@ fn fail(msg: impl std::fmt::Display) -> ! {
     std::process::exit(1);
 }
 
+/// What a chunked run was started with. A resume must match it exactly, or the
+/// chunks already merged would not fit the ones still to come.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct RunKey {
+    bbox: String,
+    scale: f64,
+    chunk_regions: i32,
+    margin_regions: i32,
+}
+
+/// Progress of a chunked run, saved after every step so the same command can
+/// pick up where a crash, reboot or unplugged drive left it. Chunks run in
+/// order, so a count of finished ones is enough.
+#[derive(Debug, Serialize, Deserialize)]
+struct RunState {
+    key: RunKey,
+    final_name: String,
+    probed: bool,
+    elevation_range: Option<(f64, f64)>,
+    terrain_base: Option<i32>,
+    next_map_id: i32,
+    chunks_done: usize,
+}
+
+impl RunState {
+    fn load(path: &Path) -> Option<Self> {
+        let text = fs::read_to_string(path).ok()?;
+        Some(serde_json::from_str(&text).unwrap_or_else(|e| {
+            fail(format!("unreadable run state {}: {e}", path.display()))
+        }))
+    }
+
+    /// Written to a temp file and renamed, so a crash mid-write cannot leave a
+    /// half state behind.
+    fn save(&self, path: &Path) {
+        let tmp = path.with_extension("json.tmp");
+        let text = serde_json::to_string_pretty(self).expect("serialize run state");
+        fs::write(&tmp, text)
+            .and_then(|_| fs::rename(&tmp, path))
+            .unwrap_or_else(|e| fail(format!("save run state {}: {e}", path.display())));
+    }
+}
+
+/// A chunk (or its probe) gets this many tries: a child that exhausted every
+/// Overpass mirror once often succeeds a minute later, and one flaky request
+/// should not stop a run that takes a day.
+const CHUNK_ATTEMPTS: u32 = 3;
+
+fn with_retries<T>(label: &str, mut attempt: impl FnMut() -> Result<T, String>) -> T {
+    for n in 1..=CHUNK_ATTEMPTS {
+        match attempt() {
+            Ok(v) => return v,
+            Err(e) if n < CHUNK_ATTEMPTS => {
+                eprintln!(
+                    "{} {label} failed ({e}); retrying in 60 s ({n}/{CHUNK_ATTEMPTS})",
+                    "Warning:".yellow().bold()
+                );
+                std::thread::sleep(std::time::Duration::from_secs(60));
+            }
+            Err(e) => fail(format!(
+                "{label} failed {CHUNK_ATTEMPTS} times ({e}). Run the same command again to resume."
+            )),
+        }
+    }
+    unreachable!()
+}
+
 /// Runs the whole chunked generation and exits.
 pub fn run(args: &Args) -> ! {
     let bbox = args
@@ -165,11 +233,64 @@ pub fn run(args: &Args) -> ! {
         .name
         .clone()
         .unwrap_or_else(|| "Arnis World".to_string());
-    let final_name =
-        crate::world_utils::generate_unique_custom_world_name(&output_dir, &requested_name);
-    let final_world = output_dir.join(&final_name);
-    let scratch = output_dir.join(format!(".{final_name}.chunks"));
+
+    let ref_arg = format!(
+        "{},{},{},{}",
+        bbox.min().lat(),
+        bbox.min().lng(),
+        bbox.max().lat(),
+        bbox.max().lng()
+    );
+    let key = RunKey {
+        bbox: ref_arg.clone(),
+        scale: args.scale,
+        chunk_regions,
+        margin_regions,
+    };
+
+    // Keyed on the name asked for, not the de-duplicated one: rerunning the same
+    // command must find the unfinished run rather than start a "(2)" beside it.
+    let safe_name: String = requested_name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+        .collect();
+    let scratch = output_dir.join(format!(".{safe_name}.chunks"));
     fs::create_dir_all(&scratch).unwrap_or_else(|e| fail(format!("create scratch dir: {e}")));
+    let state_path = scratch.join("state.json");
+
+    let mut state = match RunState::load(&state_path) {
+        Some(state) if state.key == key => {
+            println!(
+                "{} {}/{} chunk(s) already done; resuming.",
+                "Resuming:".bold(),
+                state.chunks_done,
+                plans.len()
+            );
+            state
+        }
+        Some(_) => fail(format!(
+            "{} holds an unfinished chunked run with a different area or settings. \
+             Finish it with its original command, delete that folder, or use another --name.",
+            scratch.display()
+        )),
+        None => {
+            let state = RunState {
+                key,
+                final_name: crate::world_utils::generate_unique_custom_world_name(
+                    &output_dir,
+                    &requested_name,
+                ),
+                probed: false,
+                elevation_range: args.elevation_range,
+                terrain_base: args.terrain_base,
+                next_map_id: crate::decals::registry::DecalRegistry::FIRST_ID,
+                chunks_done: 0,
+            };
+            state.save(&state_path);
+            state
+        }
+    };
+    let final_world = output_dir.join(&state.final_name);
 
     println!(
         "{} {} x {} blocks as {} chunk(s) of up to {chunk_regions}x{chunk_regions} regions \
@@ -180,31 +301,24 @@ pub fn run(args: &Args) -> ! {
         plans.len()
     );
 
-    let ref_arg = format!(
-        "{},{},{},{}",
-        bbox.min().lat(),
-        bbox.min().lng(),
-        bbox.max().lat(),
-        bbox.max().lng()
-    );
-
     // Phase 1: one height range and one terrain base for the whole world. The
     // base is the highest any chunk needs: each derives it from the deepest
     // water it must carve, and a higher base only leaves more room below.
-    let mut elevation_range = args.elevation_range;
-    let mut terrain_base = args.terrain_base;
-    if args.terrain() && (elevation_range.is_none() || terrain_base.is_none()) {
+    let needs_probe =
+        args.terrain() && (state.elevation_range.is_none() || state.terrain_base.is_none());
+    if needs_probe && !state.probed {
         let mut lo = f64::INFINITY;
         let mut hi = f64::NEG_INFINITY;
         let mut base = i32::MIN;
-        {
-            for plan in &plans {
-                println!(
-                    "{} measuring terrain height, chunk {}/{}...",
-                    "[chunks]".bold(),
-                    plan.index + 1,
-                    plans.len()
-                );
+        for plan in &plans {
+            println!(
+                "{} measuring terrain height, chunk {}/{}...",
+                "[chunks]".bold(),
+                plan.index + 1,
+                plans.len()
+            );
+            let label = format!("terrain probe for chunk {}", plan.index + 1);
+            let (range, chunk_base) = with_retries(&label, || {
                 let output = Command::new(&exe)
                     .args(&passthrough)
                     .arg(format!("--bbox={}", bbox_arg(&reference, plan)))
@@ -214,44 +328,30 @@ pub fn run(args: &Args) -> ! {
                     .arg(&scratch)
                     .stderr(Stdio::inherit())
                     .output()
-                    .unwrap_or_else(|e| fail(format!("start chunk probe: {e}")));
+                    .map_err(|e| e.to_string())?;
                 if !output.status.success() {
-                    fail(format!("terrain probe failed for chunk {}", plan.index + 1));
+                    return Err(output.status.to_string());
                 }
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let line = stdout
-                    .lines()
-                    .find_map(|l| l.strip_prefix("ARNIS_ELEVATION_RANGE "))
-                    .unwrap_or_else(|| fail("terrain probe printed no range"));
-                let mut it = line.split_whitespace().map(|v| v.parse::<f64>());
-                match (it.next(), it.next()) {
-                    (Some(Ok(a)), Some(Ok(b))) => {
-                        lo = lo.min(a);
-                        hi = hi.max(b);
-                    }
-                    _ => fail(format!("bad terrain probe output: {line}")),
-                }
-                let chunk_base = stdout
-                    .lines()
-                    .find_map(|l| l.strip_prefix("ARNIS_TERRAIN_BASE "))
-                    .and_then(|v| v.trim().parse::<i32>().ok())
-                    .unwrap_or_else(|| fail("terrain probe printed no base"));
-                base = base.max(chunk_base);
-            }
+                parse_probe(&String::from_utf8_lossy(&output.stdout))
+            });
+            lo = lo.min(range.0);
+            hi = hi.max(range.1);
+            base = base.max(chunk_base);
         }
-        let range = *elevation_range.get_or_insert((lo, hi));
-        let base = *terrain_base.get_or_insert(base);
+        state.elevation_range.get_or_insert((lo, hi));
+        state.terrain_base.get_or_insert(base);
+        state.probed = true;
+        state.save(&state_path);
+    }
+    if let (Some((lo, hi)), Some(base)) = (state.elevation_range, state.terrain_base) {
         println!(
-            "{} shared height range {:.1} m .. {:.1} m, terrain base y={base}",
-            "[chunks]".bold(),
-            range.0,
-            range.1
+            "{} shared height range {lo:.1} m .. {hi:.1} m, terrain base y={base}",
+            "[chunks]".bold()
         );
     }
 
     // Phase 2: generate each chunk and move its owned regions into the world.
-    let mut next_map_id = crate::decals::registry::DecalRegistry::FIRST_ID;
-    for plan in &plans {
+    for plan in plans.iter().skip(state.chunks_done) {
         println!(
             "{} generating chunk {}/{} (regions x {}..{}, z {}..{})",
             "[chunks]".bold(),
@@ -263,45 +363,50 @@ pub fn run(args: &Args) -> ! {
             plan.region_z.1 - 1
         );
         let chunk_out = scratch.join(format!("chunk-{}", plan.index));
-        if chunk_out.exists() {
-            fs::remove_dir_all(&chunk_out)
-                .unwrap_or_else(|e| fail(format!("clear chunk dir: {e}")));
-        }
-        fs::create_dir_all(&chunk_out).unwrap_or_else(|e| fail(format!("create chunk dir: {e}")));
+        let label = format!("chunk {}", plan.index + 1);
+        with_retries(&label, || {
+            if chunk_out.exists() {
+                fs::remove_dir_all(&chunk_out).map_err(|e| format!("clear chunk dir: {e}"))?;
+            }
+            fs::create_dir_all(&chunk_out).map_err(|e| format!("create chunk dir: {e}"))?;
+            let mut cmd = Command::new(&exe);
+            cmd.args(&passthrough)
+                .arg(format!("--bbox={}", bbox_arg(&reference, plan)))
+                .arg(format!("--reference-bbox={ref_arg}"))
+                .arg(format!("--map-id-base={}", state.next_map_id))
+                .arg("--output-dir")
+                .arg(&chunk_out)
+                .arg("--name")
+                .arg("chunk");
+            if let Some((lo, hi)) = state.elevation_range {
+                cmd.arg(format!("--elevation-range={lo},{hi}"));
+            }
+            if let Some(base) = state.terrain_base {
+                cmd.arg(format!("--terrain-base={base}"));
+            }
+            let status = cmd.status().map_err(|e| e.to_string())?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(status.to_string())
+            }
+        });
 
-        let mut cmd = Command::new(&exe);
-        cmd.args(&passthrough)
-            .arg(format!("--bbox={}", bbox_arg(&reference, plan)))
-            .arg(format!("--reference-bbox={ref_arg}"))
-            .arg(format!("--map-id-base={next_map_id}"))
-            .arg("--output-dir")
-            .arg(&chunk_out)
-            .arg("--name")
-            .arg("chunk");
-        if let Some((lo, hi)) = elevation_range {
-            cmd.arg(format!("--elevation-range={lo},{hi}"));
+        // A crash between the first chunk's move and its state save leaves a
+        // partial base world behind; nothing else can be in it yet.
+        if plan.index == 0 && final_world.exists() {
+            fs::remove_dir_all(&final_world)
+                .unwrap_or_else(|e| fail(format!("clear partial world: {e}")));
         }
-        if let Some(base) = terrain_base {
-            cmd.arg(format!("--terrain-base={base}"));
-        }
-        let status = cmd
-            .status()
-            .unwrap_or_else(|e| fail(format!("start chunk {}: {e}", plan.index + 1)));
-        if !status.success() {
-            fail(format!(
-                "chunk {} failed ({status}); finished chunks are in {}",
-                plan.index + 1,
-                final_world.display()
-            ));
-        }
-
         let chunk_world = chunk_out.join("chunk");
-        next_map_id = merge_chunk(&chunk_world, &final_world, plan, next_map_id)
+        state.next_map_id = merge_chunk(&chunk_world, &final_world, plan, state.next_map_id)
             .unwrap_or_else(|e| fail(format!("merge chunk {}: {e}", plan.index + 1)));
+        state.chunks_done = plan.index + 1;
+        state.save(&state_path);
         let _ = fs::remove_dir_all(&chunk_out);
     }
 
-    if let Err(e) = crate::world_utils::update_level_name(&final_world, &final_name) {
+    if let Err(e) = crate::world_utils::update_level_name(&final_world, &state.final_name) {
         eprintln!("Warning: could not set the world name: {e}");
     }
     let _ = fs::remove_dir_all(&scratch);
@@ -312,6 +417,24 @@ pub fn run(args: &Args) -> ! {
         final_world.display()
     );
     std::process::exit(0);
+}
+
+/// The height range and terrain base a `--probe-elevation` child printed.
+fn parse_probe(stdout: &str) -> Result<((f64, f64), i32), String> {
+    let range = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("ARNIS_ELEVATION_RANGE "))
+        .ok_or("probe printed no range")?;
+    let mut it = range.split_whitespace().map(str::parse::<f64>);
+    let (Some(Ok(lo)), Some(Ok(hi))) = (it.next(), it.next()) else {
+        return Err(format!("bad probe range: {range}"));
+    };
+    let base = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("ARNIS_TERRAIN_BASE "))
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .ok_or("probe printed no base")?;
+    Ok(((lo, hi), base))
 }
 
 /// Moves one finished chunk's owned regions (and its signage maps) into the
@@ -423,5 +546,44 @@ mod tests {
         assert_eq!(parse_region_name("r.1.mca"), None);
         assert_eq!(parse_map_id("map_42.dat"), Some(42));
         assert_eq!(parse_map_id("idcounts.dat"), None);
+    }
+
+    #[test]
+    fn probe_output_parses_and_rejects_missing_lines() {
+        let out = "noise\nARNIS_ELEVATION_RANGE -3.5 2100.25\nARNIS_TERRAIN_BASE -12\n";
+        assert_eq!(parse_probe(out), Ok(((-3.5, 2100.25), -12)));
+        assert!(parse_probe("ARNIS_ELEVATION_RANGE 1 2\n").is_err());
+        assert!(parse_probe("ARNIS_TERRAIN_BASE 4\n").is_err());
+    }
+
+    #[test]
+    fn run_state_survives_a_save_and_load() {
+        let dir = std::env::temp_dir().join(format!("arnis-state-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let state = RunState {
+            key: RunKey {
+                bbox: "1,2,3,4".into(),
+                scale: 1.0,
+                chunk_regions: 16,
+                margin_regions: 1,
+            },
+            final_name: "World (2)".into(),
+            probed: true,
+            elevation_range: Some((-1.0, 3000.0)),
+            terrain_base: Some(-20),
+            next_map_id: 57,
+            chunks_done: 3,
+        };
+        state.save(&path);
+        let back = RunState::load(&path).unwrap();
+        assert_eq!(back.key, state.key);
+        assert_eq!(back.final_name, "World (2)");
+        assert_eq!(back.terrain_base, Some(-20));
+        assert_eq!(back.next_map_id, 57);
+        assert_eq!(back.chunks_done, 3);
+        assert!(!path.with_extension("json.tmp").exists());
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(&dir).unwrap();
     }
 }
